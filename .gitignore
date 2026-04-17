@@ -14,3 +14,6 @@ build/
 .claude/*
 !.claude/CLAUDE.md
 cves.db
+
+# External asset configuration (user-specific, may contain internal asset names)
+assets.json

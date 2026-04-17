@@ -4,6 +4,23 @@ ThreatPulse - CVE Collector Service
 Continuous CVE threat monitoring and reporting tool.
 Downloads and processes CVE data, updates database only.
 Run via cron every 30 minutes or as needed.
+
+Asset configuration flags (processed by config.py before collection starts):
+  --assets-file <path>   Load asset inventory and weights from a JSON file
+                         instead of the built-in defaults. If omitted, looks
+                         for 'assets.json' in the current directory.
+  --init-assets          Copy assets.default.json to 'assets.json' in the
+                         current directory, then exit. Prompts before
+                         overwriting an existing file.
+
+Examples:
+  python cve_collector.py
+  python cve_collector.py --assets-file /etc/threatpulse/assets.json
+  python cve_collector.py --init-assets
+
+Cron usage with a custom assets file:
+  */30 * * * * /usr/bin/python /opt/threatpulse/cve_collector.py \\
+      --assets-file /etc/threatpulse/assets.json >> /var/log/threatpulse.log 2>&1
 """
 
 import csv
