@@ -1,0 +1,28 @@
+{
+  "assets": {
+    "web_servers": ["apache", "nginx", "iis", "httpd", "tomcat"],
+    "operating_systems": ["windows", "ubuntu", "centos", "rhel", "linux", "macos"],
+    "databases": ["mysql", "postgresql", "sql server", "oracle", "mongodb", "mssql"],
+    "network_devices": ["cisco", "palo alto", "fortinet", "juniper", "f5"],
+    "cloud_services": ["aws", "azure", "google cloud", "office 365", "oci"],
+    "applications": ["wordpress", "drupal", "joomla", "exchange", "sharepoint"],
+    "pam_tools": ["delinea", "cyberark", "thycotic", "one identity", "okta", "beyond trust", "strongdm", "duo"],
+    "security_tools": ["splunk", "sentinel", "crowdstrike", "defender", "firewall"],
+    "types": ["buffer overflow", "xss", "csrf", "xsrf", "sql injection", "rce", "directory traversal"],
+    "devops": ["ansible", "terraform", "jenkins", "git", "github", "gitlab", "docker", "kubernetes", "openshift"],
+    "ai": ["chatgpt", "gpt-4", "bard", "claude", "dall-e", "midjourney", "copilot"]
+  },
+  "category_weights": {
+    "web_servers": 1.0,
+    "databases": 0.9,
+    "operating_systems": 0.8,
+    "security_tools": 1.0,
+    "pam_tools": 1.0,
+    "network_devices": 0.7,
+    "cloud_services": 0.9,
+    "applications": 0.6,
+    "devops": 0.7,
+    "ai": 0.5,
+    "types": 0.8
+  }
+}
