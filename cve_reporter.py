@@ -533,19 +533,9 @@ Examples:
   %(prog)s --new --output report.txt     # Save to file
   %(prog)s --new --mark-processed        # Mark shown CVEs as processed
 
-Asset configuration flags (processed by config.py before argparse runs):
-  --assets-file <path>   Load asset inventory and weights from a JSON file.
-                         Falls back to 'assets.json' in the current directory,
-                         then to assets.default.json alongside config.py.
-  --init-assets          Copy assets.default.json to 'assets.json', then exit.
-                         Prompts before overwriting an existing file.
-
-  These flags are consumed by config.py at import time and will NOT appear
-  in --help output, but are fully functional alongside any reporter flag.
-
-Cron usage with a custom assets file:
+Cron usage:
   */30 * * * * /usr/bin/python /opt/threatpulse/cve_reporter.py \\
-      --assets-file /etc/threatpulse/assets.json --new --format json \\
+      --new --format json \\
       --output /var/reports/cves.json >> /var/log/threatpulse.log 2>&1
         """
     )
