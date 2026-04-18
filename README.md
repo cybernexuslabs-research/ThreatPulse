@@ -61,6 +61,13 @@ A modular threat monitoring tool that separates data collection from reporting, 
 - Text and JSON output formats
 - Dashboard summary view
 - Asset-specific reports
+- Single CVE deep-dive lookup (`--cve`)
+
+### ✅ External Asset Configuration
+- Asset inventory and weights stored in `assets.json` (separate from code)
+- Ship-safe default config via `assets.default.json`
+- Override at runtime with `--assets-file <path>` (cron-friendly)
+- Scaffold your own config with `--init-assets`
 
 ## Installation
 
@@ -69,31 +76,66 @@ A modular threat monitoring tool that separates data collection from reporting, 
 pip install -r requirements.txt
 
 # Make scripts executable
-chmod +x cve_collector.py cve_reporter.py
+chmod +x cve_collector.py cve_reporter.py setup.py
+```
 
-# Initialize database
-python3 cve_collector.py
+## First-Time Setup
+
+Run `setup.py` once to initialize the database and create the table schema from `schema.sql`:
+
+```bash
+python3 setup.py
+```
+
+What it does:
+1. **Checks dependencies** — verifies the `requests` module is installed; exits with instructions if it's missing
+2. **Creates `cves.db`** — applies `schema.sql` to create the `cves` table, indexes, and the `cve_stats` view
+3. **Prompts before overwriting** — if `cves.db` already exists, you're asked to confirm before it's recreated
+4. **Prints next steps** — reminds you to create your asset config and run the collector
+
+After setup completes, initialize your asset configuration and run the first collection:
+
+```bash
+# Scaffold your asset inventory
+./cve_reporter.py --init-assets
+
+# Edit assets.json with your environment's assets and weights
+# Then run the collector to populate the database
+./cve_collector.py
 ```
 
 ## Configuration
 
-Edit `config.py` to customize your environment:
+Asset inventory and category weights live in `assets.json`, not `config.py`. On first run, create your config from the shipped default:
 
-```python
-MY_ASSETS = {
-    'web_servers': ['apache', 'nginx', 'iis'],
-    'databases': ['mysql', 'postgresql'],
-    'cloud_services': ['aws', 'azure'],
-    # ... add your assets
-}
+```bash
+./cve_reporter.py --init-assets   # copies assets.default.json → assets.json
+```
 
-CATEGORY_WEIGHTS = {
-    'web_servers': 1.0,      # High priority
-    'databases': 0.9,        # High priority
-    'applications': 0.6,     # Medium priority
-    # ... adjust weights
+Then edit `assets.json`:
+
+```json
+{
+  "assets": {
+    "web_servers": ["apache", "nginx", "iis"],
+    "databases": ["mysql", "postgresql"],
+    "cloud_services": ["aws", "azure"]
+  },
+  "category_weights": {
+    "web_servers": 1.0,
+    "databases": 0.9,
+    "cloud_services": 0.9
+  }
 }
 ```
+
+To use a different asset file (e.g. per-environment configs or cron jobs):
+
+```bash
+./cve_reporter.py --assets-file /etc/threatpulse/assets.json --new
+```
+
+Resolution order: `--assets-file` flag → `assets.json` in the current directory → `assets.default.json` alongside `config.py`.
 
 ## Usage
 
@@ -157,6 +199,29 @@ CATEGORY_WEIGHTS = {
 # CVEs since specific date
 ./cve_reporter.py --since 2024-01-01
 ```
+
+#### CVE Detail Lookup
+
+Jump directly to any CVE in the database for a full-record view — CVSS score, description, exploit/POC status, which asset keywords matched, a chronological processing timeline, and a raw dump of all 18 database columns.
+
+```bash
+# Full detail view
+./cve_reporter.py --cve CVE-2026-12345
+
+# Case-insensitive — both forms work
+./cve_reporter.py --cve cve-2026-12345
+
+# JSON output (all 18 columns + generated_at)
+./cve_reporter.py --cve CVE-2026-12345 --format json
+
+# Save to file
+./cve_reporter.py --cve CVE-2026-12345 --output /tmp/cve-detail.txt
+
+# Mark as processed after viewing
+./cve_reporter.py --cve CVE-2026-12345 --mark-processed
+```
+
+If the CVE is not in the database, a not-found message is printed and the command exits with code `1`.
 
 #### Asset-Specific Reports
 
@@ -317,19 +382,18 @@ Day 7:  NVD updates CVE
 
 ### Adding New Assets
 
-Edit `config.py`:
+Edit `assets.json` (create it first with `./cve_reporter.py --init-assets` if it doesn't exist):
 
-```python
-MY_ASSETS = {
-    'containers': ['docker', 'kubernetes', 'containerd'],
-    'monitoring': ['prometheus', 'grafana', 'elasticsearch'],
-    # ...
-}
-
-CATEGORY_WEIGHTS = {
-    'containers': 0.9,  # High priority
-    'monitoring': 0.6,  # Medium priority
-    # ...
+```json
+{
+  "assets": {
+    "containers": ["docker", "kubernetes", "containerd"],
+    "monitoring": ["prometheus", "grafana", "elasticsearch"]
+  },
+  "category_weights": {
+    "containers": 0.9,
+    "monitoring": 0.6
+  }
 }
 ```
 
@@ -421,13 +485,17 @@ sqlite3 cves.db "SELECT * FROM cve_stats"
 
 ```
 ThreatPulse/
-├── config.py              # Configuration (assets, weights)
-├── schema.sql             # Database schema
+├── config.py              # Core configuration and asset loader
+├── assets.json            # Your asset inventory and weights (edit this)
+├── assets.default.json    # Shipped default — copied by --init-assets
+├── schema.sql             # Database schema (applied by setup.py)
+├── setup.py               # One-time setup: creates DB and tables
 ├── cve_collector.py       # Data collection service
 ├── cve_reporter.py        # Reporting service
 ├── requirements.txt       # Python dependencies
-├── cves.db               # SQLite database (created on first run)
-└── README.md             # This file
+├── cves.db                # SQLite database (created on first run)
+├── docs/                  # Feature design documents
+└── README.md              # This file
 ```
 
 ## Benefits Over Original Script
@@ -444,11 +512,12 @@ ThreatPulse/
 
 ## Next Steps
 
-1. **Customize assets** in `config.py`
-2. **Run collector** once to populate database
-3. **Set up cron** for automated collection
-4. **Test reports** with various filters
-5. **Integrate** with ticketing/alerting systems
+1. **Run setup** — `python3 setup.py` to create the database and schema
+2. **Initialize asset config** — `./cve_reporter.py --init-assets`, then edit `assets.json`
+3. **Run collector** once to populate the database — `./cve_collector.py`
+4. **Set up cron** for automated collection
+5. **Test reports** with various filters
+6. **Integrate** with ticketing/alerting systems
 
 ## License
 
