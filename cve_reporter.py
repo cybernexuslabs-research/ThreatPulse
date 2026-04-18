@@ -6,12 +6,19 @@ Generates reports from CVE database on-demand.
 Supports multiple output formats and filtering options.
 """
 
+import sys
 import sqlite3
 import json
 import argparse
+import textwrap
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import config
+
+def normalize_cve_id(raw: str) -> str:
+    """Normalize CVE ID to uppercase canonical form (e.g. cve-2026-1234 → CVE-2026-1234)."""
+    return raw.strip().upper()
+
 
 class CVEReporter:
     """Generate various reports from CVE database"""
@@ -129,6 +136,12 @@ class CVEReporter:
         """, (since_date,))
         return cursor.fetchall()
     
+    def get_cve_by_id(self, cve_id: str):
+        """Return the single cves row for cve_id, or None if not found."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM cves WHERE id = ?", (cve_id,))
+        return cursor.fetchone()
+
     def mark_as_processed(self, cve_ids: List[str]):
         """Mark CVEs as processed"""
         cursor = self.conn.cursor()
@@ -192,6 +205,20 @@ class CVEReporter:
             'critical_exploits': critical_exploits
         }
     
+    def _parse_json_field(self, value) -> list:
+        """Safely parse a JSON string field from the DB; returns [] on None or error.
+
+        Note: format_cve_text() and format_cve_json() use equivalent inline guards.
+        This helper is used by format_cve_detail() and format_cve_detail_json() only;
+        the existing formatters are left unchanged to avoid scope creep.
+        """
+        if not value:
+            return []
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
     def format_cve_text(self, cve: sqlite3.Row) -> str:
         """Format a single CVE as text"""
         exploit_flag = "🚨 EXPLOIT AVAILABLE" if cve['has_known_exploit'] else ""
@@ -247,6 +274,148 @@ class CVEReporter:
             'last_updated_date': cve['last_updated_date']
         }
     
+    def format_cve_detail(self, cve: sqlite3.Row) -> str:
+        """Format a single CVE as a full seven-section detail view for terminal output."""
+        SEP  = "=" * 70
+        DASH = "-" * 70
+        generated = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        poc_urls      = self._parse_json_field(cve['poc_urls'])
+        poc_sources   = self._parse_json_field(cve['poc_source'])
+        categories    = self._parse_json_field(cve['affected_categories'])
+        assets        = self._parse_json_field(cve['affected_assets'])
+
+        out = []
+
+        # ── 1. HEADER ──────────────────────────────────────────────────────────
+        out.append(SEP)
+        out.append(f"CVE DETAIL: {cve['id']}")
+        out.append(f"Generated: {generated}")
+        out.append(SEP)
+        out.append("")
+
+        # ── 2. IDENTITY ────────────────────────────────────────────────────────
+        out.append("IDENTITY")
+        out.append(DASH)
+        out.append(f"CVE ID:          {cve['id']}")
+        severity  = cve['base_severity'] or "N/A"
+        score     = cve['base_score'] if cve['base_score'] is not None else "N/A"
+        out.append(f"Severity:        {severity}  (CVSS Score: {score})")
+        out.append(f"Published:       {cve['published_date']}")
+        out.append(f"Last Updated:    {cve['last_updated_date'] or '(not populated)'}")
+        out.append("")
+
+        # ── 3. DESCRIPTION ─────────────────────────────────────────────────────
+        out.append("DESCRIPTION")
+        out.append(DASH)
+        description = cve['description'] or "(no description available)"
+        out.append(textwrap.fill(description, width=70))
+        out.append("")
+
+        # ── 4. EXPLOIT STATUS ──────────────────────────────────────────────────
+        out.append("EXPLOIT STATUS")
+        out.append(DASH)
+        if cve['has_known_exploit']:
+            out.append("Known Exploit:   YES  ⚠️  KNOWN EXPLOIT — IMMEDIATE PATCHING REQUIRED")
+        else:
+            out.append("Known Exploit:   NO")
+        exploit_date = cve['exploit_added_date'] or "(not populated)"
+        out.append(f"CISA KEV:        {exploit_date}")
+        if cve['has_poc']:
+            sources_str = ', '.join(poc_sources) if poc_sources else "unknown"
+            out.append(f"POC Available:   YES  (Sources: {sources_str})")
+            for url in poc_urls:
+                out.append(f"  → {url}")
+        else:
+            out.append("POC Available:   NO")
+        out.append("")
+
+        # ── 5. KEYWORD RELEVANCE ───────────────────────────────────────────────
+        out.append("KEYWORD RELEVANCE")
+        out.append(DASH)
+        if cve['affects_infrastructure']:
+            out.append("Matches Asset Inventory:  YES")
+            out.append(f"Matched Categories:       {', '.join(categories) if categories else '(none)'}")
+            out.append(f"Matched Keywords:         {', '.join(assets) if assets else '(none)'}")
+            if cve['base_score'] is not None and cve['relevance_score'] is not None:
+                weight = (cve['relevance_score'] / cve['base_score']
+                          if cve['base_score'] else 0)
+                out.append(
+                    f"Relevance Score:          {cve['relevance_score']}"
+                    f"  (CVSS {cve['base_score']} × category weight {weight:.1f})"
+                )
+            else:
+                out.append(f"Relevance Score:          {cve['relevance_score']}")
+        else:
+            out.append("Matches Asset Inventory:  NO")
+            out.append("(No configured keywords matched the CVE description)")
+        out.append("")
+
+        # ── 6. PROCESSING HISTORY ──────────────────────────────────────────────
+        out.append("PROCESSING HISTORY")
+        out.append(DASH)
+
+        events = []
+        if cve['first_seen']:
+            events.append((cve['first_seen'], "First ingested by collector"))
+        if cve['last_updated_date']:
+            events.append((cve['last_updated_date'],
+                           "Data updated  (score or exploit/POC status changed)"))
+        if cve['last_checked']:
+            events.append((cve['last_checked'],
+                           "Last checked by collector  (no changes)"))
+
+        events.sort(key=lambda e: e[0])
+        for ts, label in events:
+            out.append(f"  {ts}  {label}")
+
+        if cve['processed']:
+            out.append(f"  {cve['last_updated_date'] or 'unknown'}         Marked as processed")
+        else:
+            out.append("  [unreviewed]         Not yet marked as processed")
+        out.append("")
+
+        # ── 7. ALL ENRICHMENT DATA ─────────────────────────────────────────────
+        out.append("ALL ENRICHMENT DATA")
+        out.append(DASH)
+
+        row = dict(cve)
+        json_fields = {'poc_urls', 'poc_source', 'affected_categories', 'affected_assets'}
+        for col, val in row.items():
+            if col in json_fields:
+                parsed = self._parse_json_field(val)
+                if len(parsed) > 1:
+                    first, *rest = parsed
+                    out.append(f"{col + ':':30} [\"{first}\",")
+                    for item in rest[:-1]:
+                        out.append(f"{'':31}  \"{item}\",")
+                    out.append(f"{'':31}  \"{rest[-1]}\"]")
+                else:
+                    out.append(f"{col + ':':30} {json.dumps(parsed)}")
+            elif col == 'processed':
+                label = "(reviewed)" if val else "(unreviewed)"
+                out.append(f"{col + ':':30} {val}  {label}")
+            elif col == 'exploit_added_date' and val is None:
+                out.append(f"{col + ':':30} (not populated)")
+            else:
+                out.append(f"{col + ':':30} {val}")
+
+        out.append(SEP)
+        return "\n".join(out)
+
+    def format_cve_detail_json(self, cve: sqlite3.Row) -> str:
+        """Return a JSON string of the full CVE record with all 18 columns plus generated_at.
+
+        Returns a json.dumps() string, not a Dict — distinct from format_cve_json() which
+        returns a Dict and omits several columns (exploit_added_date, processed, last_checked).
+        """
+        generated_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        record = dict(cve)  # sqlite3.Row → dict, captures all 18 columns
+        for field in ('poc_urls', 'poc_source', 'affected_categories', 'affected_assets'):
+            record[field] = self._parse_json_field(record.get(field))
+        record['generated_at'] = generated_at
+        return json.dumps(record, indent=2, default=str)
+
     def generate_report(self, cves: List[sqlite3.Row], title: str, 
                        output_format: str = 'text', filename: Optional[str] = None):
         """Generate and output/save a report"""
@@ -408,6 +577,8 @@ Cron usage with a custom assets file:
                        help='Show CVEs since date (YYYY-MM-DD)')
     parser.add_argument('--dashboard', action='store_true',
                        help='Show dashboard summary')
+    parser.add_argument('--cve', type=str, metavar='CVE-ID',
+                       help='Display full detail for a specific CVE ID (e.g. CVE-2026-12345)')
     
     # Options
     parser.add_argument('--hours', type=int, default=24,
@@ -421,6 +592,29 @@ Cron usage with a custom assets file:
     
     args = parser.parse_args()
     
+    # CVE detail lookup
+    if args.cve:
+        cve_id = normalize_cve_id(args.cve)
+        with CVEReporter() as reporter:
+            cve = reporter.get_cve_by_id(cve_id)
+            if cve is None:
+                print(f"No data found for {cve_id}.")
+                print("Run the collector to ingest new CVEs: python cve_collector.py")
+                sys.exit(1)
+            if args.format == 'json':
+                output = reporter.format_cve_detail_json(cve)
+            else:
+                output = reporter.format_cve_detail(cve)
+            if args.output:
+                with open(args.output, 'w') as f:
+                    f.write(output)
+            else:
+                print(output)
+            if args.mark_processed:
+                reporter.mark_as_processed([cve_id])
+                print(f"\nMarked {cve_id} as processed")
+        sys.exit(0)
+
     # Show dashboard if requested
     if args.dashboard:
         with CVEReporter() as reporter:
