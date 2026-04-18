@@ -27,14 +27,20 @@ LOG_LEVEL = 'INFO'
 _DEFAULT_ASSETS_FILENAME = 'assets.default.json'
 _DEFAULT_ASSETS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), _DEFAULT_ASSETS_FILENAME)
 
+# Scripts that are allowed to consume --assets-file and --init-assets.
+# Includes both forms: 'cve_collector.py' for direct invocation
+# (python cve_collector.py) and 'cve_collector' for installed
+# console_scripts entry points where sys.argv[0] carries no extension.
+_ASSET_FLAG_CALLERS = {'cve_collector.py', 'cve_collector'}
+
 # ---------------------------------------------------------------------------
 # Asset configuration helpers
 # ---------------------------------------------------------------------------
 
-def _find_assets_file():
+def _find_assets_file(check_argv=True):
     """
     Resolve the assets file path using this priority chain:
-      1. --assets-file <path> from sys.argv
+      1. --assets-file <path> from sys.argv  (only when check_argv=True)
       2. assets.json in the current working directory
       3. assets.default.json alongside config.py
 
@@ -42,15 +48,16 @@ def _find_assets_file():
     present but no path follows it.
     Returns a path string, or None if no file exists at any location.
     """
-    for i, arg in enumerate(sys.argv):
-        if arg == '--assets-file':
-            if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith('--'):
-                logger.warning(
-                    "--assets-file flag provided but no path given — "
-                    "falling back to default resolution"
-                )
-                break  # fall through to steps 2 and 3
-            return sys.argv[i + 1]
+    if check_argv:
+        for i, arg in enumerate(sys.argv):
+            if arg == '--assets-file':
+                if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith('--'):
+                    logger.warning(
+                        "--assets-file flag provided but no path given — "
+                        "falling back to default resolution"
+                    )
+                    break  # fall through to steps 2 and 3
+                return sys.argv[i + 1]
 
     if os.path.exists('assets.json'):
         return 'assets.json'
@@ -187,18 +194,25 @@ def _resolve_assets():
     Resolution order:
       1. --init-assets in sys.argv     → copy assets.default.json to assets.json,
                                          open for editing, exit
+                                         (collector callers only)
       2. --assets-file <path>          → load and validate the specified file
+                                         (collector callers only)
       3. assets.json in cwd            → load and validate if present
       4. assets.default.json (shipped) → load and validate if present
       5. No file found                 → fatal error with instructions
+                                         (collector callers only; non-collector
+                                          callers return empty dicts and continue)
 
     Wrapped in a function so it can be called in isolation by tests without
     reimporting the module.
     """
-    if '--init-assets' in sys.argv:
+    _caller = os.path.basename(sys.argv[0])
+    _process_flags = _caller in _ASSET_FLAG_CALLERS
+
+    if _process_flags and '--init-assets' in sys.argv:
         init_assets_file()  # always raises SystemExit
 
-    assets_file = _find_assets_file()
+    assets_file = _find_assets_file(check_argv=_process_flags)
     if assets_file:
         loaded = load_assets_config(assets_file)
         kw_count = sum(len(v) for v in loaded['assets'].values())
@@ -208,13 +222,20 @@ def _resolve_assets():
         )
         return loaded['assets'], loaded['category_weights']
 
-    print(
-        f"ERROR: No asset configuration found.\n"
-        f"  Run:    python cve_collector.py --init-assets\n"
-        f"  Or ensure '{_DEFAULT_ASSETS_FILENAME}' exists alongside config.py.",
-        file=sys.stderr
-    )
-    raise SystemExit(1)
+    if _process_flags:
+        print(
+            f"ERROR: No asset configuration found.\n"
+            f"  Run:    python cve_collector.py --init-assets\n"
+            f"  Or ensure '{_DEFAULT_ASSETS_FILENAME}' exists alongside config.py.",
+            file=sys.stderr
+        )
+        raise SystemExit(1)
+
+    # Non-collector callers (reporter, setup, etc.) — assets are optional.
+    # MY_ASSETS and CATEGORY_WEIGHTS will be empty dicts; this is safe because
+    # only the collector uses them at runtime.
+    logger.debug("No asset configuration found; MY_ASSETS and CATEGORY_WEIGHTS will be empty.")
+    return {}, {}
 
 
 MY_ASSETS, CATEGORY_WEIGHTS = _resolve_assets()
