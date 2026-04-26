@@ -80,7 +80,8 @@ class CVEReporter:
         return cursor.fetchall()
     
     def get_cves_by_asset(self, asset: str, with_exploits: bool = False) -> List[sqlite3.Row]:
-        """Get CVEs affecting a specific asset"""
+        """Get CVEs affecting a specific asset.
+        Preserved for backward compatibility; main() now uses build_filtered_query()."""
         cursor = self.conn.cursor()
         query = """
             SELECT * FROM cves
@@ -96,6 +97,24 @@ class CVEReporter:
         cursor.execute(query, params)
         return cursor.fetchall()
     
+    def get_cves_by_category(self, category: str, with_exploits: bool = False) -> List[sqlite3.Row]:
+        """Get CVEs matching a specific asset category.
+        Preserved for backward compatibility; main() now uses build_filtered_query()."""
+        cursor = self.conn.cursor()
+        query = """
+            SELECT * FROM cves
+            WHERE affected_categories LIKE ?
+        """
+        params = [f'%"{category}"%']
+
+        if with_exploits:
+            query += " AND has_known_exploit = 1"
+
+        query += " ORDER BY relevance_score DESC, base_score DESC"
+
+        cursor.execute(query, params)
+        return cursor.fetchall()
+
     def get_exploit_cves(self) -> List[sqlite3.Row]:
         """Get all CVEs with known exploits"""
         cursor = self.conn.cursor()
@@ -136,6 +155,83 @@ class CVEReporter:
         """, (since_date,))
         return cursor.fetchall()
     
+    def build_filtered_query(
+        self,
+        hours: int = 24,
+        new: bool = False,
+        updated: bool = False,
+        unprocessed: bool = False,
+        relevant: bool = False,
+        since: str = None,
+        critical: bool = False,
+        severities: list = None,
+        category: str = None,
+        asset: str = None,
+        exploits_only: bool = False,
+        pocs_only: bool = False,
+    ) -> tuple:
+        """Build a composable SELECT query from any combination of active flags.
+
+        Phase 1 — primary mode sets the base WHERE condition and ORDER BY.
+        Phase 2 — composable filters append AND conditions on top of any base.
+
+        Returns (sql, params) ready for cursor.execute().
+        """
+        conditions = []
+        params = []
+
+        # --- Phase 1: Primary mode ---
+        if new:
+            cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+            conditions.append("first_seen > ?")
+            params.append(cutoff)
+        elif updated:
+            cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+            conditions.append("last_updated_date > ?")
+            params.append(cutoff)
+        elif unprocessed:
+            conditions.append("processed = 0")
+        elif relevant:
+            conditions.append("affects_infrastructure = 1")
+        elif since:
+            conditions.append("published_date >= ?")
+            params.append(since)
+
+        # --- Phase 2: Composable filters ---
+        if critical:
+            conditions.append("base_severity = 'CRITICAL'")
+        elif severities:
+            placeholders = ", ".join("?" * len(severities))
+            conditions.append(f"base_severity IN ({placeholders})")
+            params.extend(severities)
+
+        if category:
+            conditions.append("affected_categories LIKE ?")
+            params.append(f'%"{category}"%')
+
+        if asset:
+            conditions.append("affected_assets LIKE ?")
+            params.append(f'%"{asset}"%')
+
+        if exploits_only:
+            conditions.append("has_known_exploit = 1")
+
+        if pocs_only:
+            conditions.append("has_poc = 1")
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        # Per-mode ORDER BY — preserves semantics of all existing get_* methods
+        if updated:
+            order_by = "last_updated_date DESC"
+        elif relevant or category or asset or exploits_only or pocs_only:
+            order_by = "relevance_score DESC, base_score DESC"
+        else:
+            order_by = "base_score DESC, published_date DESC"
+
+        sql = f"SELECT * FROM cves {where} ORDER BY {order_by}"
+        return sql, params
+
     def get_cve_by_id(self, cve_id: str):
         """Return the single cves row for cve_id, or None if not found."""
         cursor = self.conn.cursor()
@@ -509,6 +605,32 @@ class CVEReporter:
         print("=" * 70)
 
 
+def _validate_category(category: str) -> str:
+    """Normalize and validate a category name against the loaded asset config.
+
+    Returns the normalized (lowercase) category name on success.
+    Prints a warning to stderr and exits with code 1 if unrecognized or if
+    no asset configuration is loaded.
+    """
+    normalized = category.strip().lower()
+    valid = sorted(config.MY_ASSETS.keys())
+    if not valid:
+        print(
+            "Warning: No asset categories are configured.\n"
+            "Run: python cve_collector.py --init-assets",
+            file=sys.stderr
+        )
+        sys.exit(1)
+    if normalized not in valid:
+        print(
+            f"Warning: '{category}' is not a recognized asset category.\n"
+            f"Valid categories: {', '.join(valid)}",
+            file=sys.stderr
+        )
+        sys.exit(1)
+    return normalized
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='ThreatPulse - Continuous CVE threat monitoring and reporting tool',
@@ -522,16 +644,28 @@ Examples:
   %(prog)s --critical                     # Show critical CVEs
   %(prog)s --severity HIGH,CRITICAL       # Show high and critical CVEs
   %(prog)s --asset nginx                  # Show CVEs affecting nginx
-  %(prog)s --asset mysql --with-exploits  # MySQL CVEs with exploits
+  %(prog)s --category web_servers         # All CVEs for a category
   %(prog)s --exploits-only                # All CVEs with known exploits
   %(prog)s --pocs-only                    # All CVEs with POC exploits
-  %(prog)s --new --with-pocs             # New CVEs that have POCs
   %(prog)s --relevant                     # All relevant CVEs
   %(prog)s --since 2024-01-01            # CVEs since date
-  %(prog)s --dashboard                    # Show dashboard summary
+
+Composable examples (flags combine with AND logic):
+  %(prog)s --new --critical                            # New critical CVEs
+  %(prog)s --new --category databases --exploits-only  # New DB CVEs with exploits
+  %(prog)s --unprocessed --severity CRITICAL,HIGH      # Unprocessed high-severity
+  %(prog)s --since 2026-01-01 --category network_devices  # Network CVEs since date
+  %(prog)s --relevant --exploits-only                  # Infra-relevant with exploits
+  %(prog)s --new --pocs-only                           # New CVEs that have POCs
+
+  Note: when multiple primary modes are supplied (e.g. --new --updated),
+  the first one wins silently. Use one primary mode at a time.
+
+Output options:
   %(prog)s --new --format json           # Output as JSON
   %(prog)s --new --output report.txt     # Save to file
   %(prog)s --new --mark-processed        # Mark shown CVEs as processed
+  %(prog)s --dashboard                    # Show dashboard summary
 
 Cron usage:
   */30 * * * * /usr/bin/python /opt/threatpulse/cve_reporter.py \\
@@ -547,20 +681,24 @@ Cron usage:
                        help='Show recently updated CVEs')
     parser.add_argument('--unprocessed', action='store_true',
                        help='Show unprocessed CVEs')
-    parser.add_argument('--critical', action='store_true',
+    severity_group = parser.add_mutually_exclusive_group()
+    severity_group.add_argument('--critical', action='store_true',
                        help='Show critical CVEs')
-    parser.add_argument('--severity', type=str,
+    severity_group.add_argument('--severity', type=str,
                        help='Severity levels (comma-separated: CRITICAL,HIGH,MEDIUM,LOW)')
-    parser.add_argument('--asset', type=str,
+    asset_group = parser.add_mutually_exclusive_group()
+    asset_group.add_argument('--asset', type=str,
                        help='Filter by asset name')
+    asset_group.add_argument('--category', type=str,
+                       help='Filter by asset category (e.g. web_servers, databases)')
     parser.add_argument('--with-exploits', action='store_true',
-                       help='Only show CVEs with known exploits (use with --asset)')
+                       help='Deprecated alias for --exploits-only; use --exploits-only instead')
     parser.add_argument('--exploits-only', action='store_true',
-                       help='Show all CVEs with known exploits')
+                       help='Show CVEs with known exploits (composable with any base mode)')
     parser.add_argument('--pocs-only', action='store_true',
-                       help='Show all CVEs with POC exploits')
+                       help='Show CVEs with POC exploits (composable with any base mode)')
     parser.add_argument('--with-pocs', action='store_true',
-                       help='Filter results to only show CVEs with POCs')
+                       help='Deprecated alias for --pocs-only; use --pocs-only instead')
     parser.add_argument('--relevant', action='store_true',
                        help='Show all CVEs relevant to infrastructure')
     parser.add_argument('--since', type=str,
@@ -613,69 +751,80 @@ Cron usage:
     
     # Determine which report to generate
     with CVEReporter() as reporter:
-        cves = []
-        title = ""
-        
-        if args.new:
-            cves = reporter.get_new_cves(args.hours)
-            title = f"New CVEs (Last {args.hours} Hours)"
-        
-        elif args.updated:
-            cves = reporter.get_updated_cves(args.hours)
-            title = f"Updated CVEs (Last {args.hours} Hours)"
-        
-        elif args.unprocessed:
-            cves = reporter.get_unprocessed_cves()
-            title = "Unprocessed CVEs"
-        
-        elif args.critical:
-            cves = reporter.get_cves_by_severity(['CRITICAL'])
-            title = "Critical CVEs"
-        
-        elif args.severity:
-            severities = [s.strip().upper() for s in args.severity.split(',')]
-            cves = reporter.get_cves_by_severity(severities)
-            title = f"CVEs - Severity: {', '.join(severities)}"
-        
-        elif args.asset:
-            cves = reporter.get_cves_by_asset(args.asset, args.with_exploits)
-            title = f"CVEs Affecting: {args.asset}"
-            if args.with_exploits:
-                title += " (With Known Exploits)"
-        
-        elif args.exploits_only:
-            cves = reporter.get_exploit_cves()
-            title = "CVEs with Known Exploits"
 
-        elif args.pocs_only:
-            cves = reporter.get_poc_cves()
-            title = "CVEs with POC Exploits"
+        # Validate --category early so invalid names exit before any query
+        category = _validate_category(args.category) if args.category else None
 
-        elif args.relevant:
-            cves = reporter.get_relevant_cves()
-            title = "Relevant CVEs (Infrastructure)"
-        
-        elif args.since:
-            cves = reporter.get_cves_since_date(args.since)
-            title = f"CVEs Since {args.since}"
-        
-        else:
+        # Resolve deprecated aliases — OR with modern equivalents so that
+        # --with-exploits and --with-pocs still work and pass the no_flags check
+        exploits_only  = bool(args.exploits_only) or bool(args.with_exploits)
+        pocs_only_flag = bool(args.pocs_only) or bool(args.with_pocs)
+
+        severities = ([s.strip().upper() for s in args.severity.split(',')]
+                      if args.severity else None)
+
+        # Detect whether any actionable flag was supplied
+        no_flags = not any([args.new, args.updated, args.unprocessed, args.relevant,
+                            args.since, args.critical, severities, category,
+                            args.asset, exploits_only, pocs_only_flag])
+        if no_flags:
             parser.print_help()
             return
-        
-        # Apply --with-pocs filter if specified
-        if args.with_pocs and cves:
-            cves = [cve for cve in cves if cve['has_poc']]
-            title += " (With POCs)"
 
-        # Generate report
-        if args.output:
-            filename = args.output
-        else:
-            filename = None
-        
-        reporter.generate_report(cves, title, args.format, filename)
-        
+        sql, params = reporter.build_filtered_query(
+            hours=args.hours,
+            new=args.new,
+            updated=args.updated,
+            unprocessed=args.unprocessed,
+            relevant=args.relevant,
+            since=args.since,
+            critical=args.critical,
+            severities=severities,
+            category=category,
+            asset=args.asset,
+            exploits_only=exploits_only,
+            pocs_only=pocs_only_flag,
+        )
+
+        cursor = reporter.conn.cursor()
+        cursor.execute(sql, params)
+        cves = cursor.fetchall()
+
+        if not cves:
+            print("No CVEs found matching the specified filters.")
+            sys.exit(0)
+
+        # Dynamic title reflecting all active flags
+        title_parts = []
+        if args.new:
+            title_parts.append(f"New (Last {args.hours}h)")
+        elif args.updated:
+            title_parts.append(f"Updated (Last {args.hours}h)")
+        elif args.unprocessed:
+            title_parts.append("Unprocessed")
+        elif args.relevant:
+            title_parts.append("Relevant")
+        elif args.since:
+            title_parts.append(f"Since {args.since}")
+
+        if args.critical:
+            title_parts.append("Critical")
+        elif severities:
+            title_parts.append(f"Severity: {', '.join(severities)}")
+
+        if category:
+            title_parts.append(f"Category: {category}")
+        if args.asset:
+            title_parts.append(f"Asset: {args.asset}")
+        if exploits_only:
+            title_parts.append("Exploits Only")
+        if pocs_only_flag:
+            title_parts.append("POCs Only")
+
+        title = "CVEs — " + " | ".join(title_parts) if title_parts else "All CVEs"
+
+        reporter.generate_report(cves, title, args.format, args.output)
+
         # Mark as processed if requested
         if args.mark_processed and cves:
             cve_ids = [cve['id'] for cve in cves]
