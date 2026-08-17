@@ -12,6 +12,7 @@ import sqlite3
 import json
 import csv
 import io
+import re
 import html as html_escape_module
 import argparse
 import textwrap
@@ -38,6 +39,43 @@ CVE_COLUMNS = [
 
 # Columns whose DB representation is a JSON-encoded array string.
 JSON_ARRAY_COLUMNS = {'affected_categories', 'affected_assets', 'poc_urls', 'poc_source'}
+
+# Collections / Watchlists schema (see docs/features/COLLECTIONS_WATCHLISTS_FEATURE.md).
+# Inlined (rather than read from schema.sql at runtime) so the reporter keeps
+# no dependency on schema.sql being present in the working directory. Kept in
+# sync with the CREATE TABLE/INDEX statements appended to schema.sql — both
+# use IF NOT EXISTS, so running either (or both) more than once is a no-op.
+# Both FK columns on collection_members cascade on delete: collection_id so
+# deleting a collection cleans up its membership rows, and cve_id so a CVE
+# removed from `cves` doesn't leave orphaned membership rows behind. Cascades
+# only fire when the connection has `PRAGMA foreign_keys = ON` (see
+# CVEReporter.__enter__).
+_COLLECTIONS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS collections (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS collection_members (
+    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    cve_id        TEXT    NOT NULL REFERENCES cves(id) ON DELETE CASCADE,
+    added_at      TEXT    NOT NULL,
+    PRIMARY KEY (collection_id, cve_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_collection_members_cve ON collection_members(cve_id);
+"""
+
+# Matches the placeholder tokens in CVEReporter._HTML_TEMPLATE. Used with
+# re.sub()'s callback form (see format_list_html) so token substitution is a
+# single pass over the *original* template — chaining separate str.replace()
+# calls would re-scan each already-substituted result for the next token,
+# and a CVE description or --asset/--category value that happens to contain
+# the literal text "___HEADER___" would get corrupted by a later replace().
+_HTML_TOKEN_RE = re.compile(r'___(?:DATA_JSON|HEADER)___')
 
 # Leading characters that spreadsheet applications (Excel, Sheets, LibreOffice)
 # interpret as the start of a formula. A leading apostrophe neutralizes this
@@ -102,11 +140,37 @@ class CVEReporter:
     def __enter__(self):
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
+        # Required for collection_members' ON DELETE CASCADE to actually fire —
+        # SQLite does not enforce FK constraints by default. Must be set before
+        # any DDL/DML, which is guaranteed here (first statement post-connect).
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        # cve_collector.py is a separate writer process with no lock
+        # coordination (cron runs every 30 min per this file's own epilog);
+        # retry briefly instead of immediately raising "database is locked"
+        # if a report happens to race a collector write.
+        self.conn.execute("PRAGMA busy_timeout = 5000")
+        self._ensure_collections_schema()
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.conn:
             self.conn.close()
+
+    def _ensure_collections_schema(self):
+        """Create the collections/collection_members tables if missing.
+
+        Checks sqlite_master first (a plain indexed read, no write lock)
+        rather than unconditionally running CREATE TABLE IF NOT EXISTS on
+        every invocation — cve_reporter.py must stay read-only for read-only
+        commands (--dashboard, --cve, a plain filtered query), and DDL takes
+        a write lock even when it ends up being a no-op.
+        """
+        exists = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='collections'"
+        ).fetchone()
+        if exists is None:
+            self.conn.executescript(_COLLECTIONS_SCHEMA_SQL)
+            self.conn.commit()
     
     def get_new_cves(self, hours: int = 24) -> List[sqlite3.Row]:
         """Get CVEs added in the last N hours"""
@@ -241,6 +305,7 @@ class CVEReporter:
         asset: str = None,
         exploits_only: bool = False,
         pocs_only: bool = False,
+        collection_id: int = None,
     ) -> tuple:
         """Build a composable SELECT query from any combination of active flags.
 
@@ -291,18 +356,151 @@ class CVEReporter:
         if pocs_only:
             conditions.append("has_poc = 1")
 
+        if collection_id is not None:
+            # Subquery (not a JOIN) keeps SELECT * FROM cves semantics intact
+            # and composes trivially with the condition-list/params-list
+            # building above.
+            conditions.append("id IN (SELECT cve_id FROM collection_members WHERE collection_id = ?)")
+            params.append(collection_id)
+
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
         # Per-mode ORDER BY — preserves semantics of all existing get_* methods
         if updated:
             order_by = "last_updated_date DESC"
-        elif relevant or category or asset or exploits_only or pocs_only:
+        elif relevant or category or asset or exploits_only or pocs_only or collection_id:
             order_by = "relevance_score DESC, base_score DESC"
         else:
             order_by = "base_score DESC, published_date DESC"
 
         sql = f"SELECT * FROM cves {where} ORDER BY {order_by}"
         return sql, params
+
+    # ------------------------------------------------------------------
+    # Collections / Watchlists data-access layer
+    # (see docs/features/COLLECTIONS_WATCHLISTS_FEATURE.md)
+    # ------------------------------------------------------------------
+
+    def get_collection_id(self, name: str) -> Optional[int]:
+        """Resolve a collection name to its id, or None if it doesn't exist."""
+        row = self.conn.execute(
+            "SELECT id FROM collections WHERE name = ?", (name,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def create_collection(self, name: str, description: Optional[str] = None):
+        """Insert a new collection row.
+
+        Callers should pre-check get_collection_id(name) is None first (for
+        a clean "already exists" message in the common case); this also
+        catches sqlite3.IntegrityError as a race-condition backstop (two
+        concurrent invocations creating the same name) and exits the same
+        way the pre-check does, so behavior is identical either way.
+        """
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            self.conn.execute(
+                "INSERT INTO collections (name, description, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (name, description, now, now),
+            )
+            self.conn.commit()
+        except sqlite3.IntegrityError:
+            print(f"Collection already exists: {name}", file=sys.stderr)
+            sys.exit(1)
+
+    def list_collections(self) -> List[sqlite3.Row]:
+        """Return all collections with a computed member_count, oldest first.
+
+        LEFT JOIN + COUNT(m.cve_id) (not COUNT(*)) so empty collections show
+        0 members instead of 1 (a bare COUNT(*) would count the single NULL
+        row a LEFT JOIN produces for a collection with no members).
+        """
+        return self.conn.execute("""
+            SELECT c.*, COUNT(m.cve_id) AS member_count
+            FROM collections c
+            LEFT JOIN collection_members m ON m.collection_id = c.id
+            GROUP BY c.id
+            ORDER BY c.created_at ASC
+        """).fetchall()
+
+    def get_collection_member_count(self, collection_id: int) -> int:
+        """Total CVE count for a collection, independent of any other active filters.
+
+        The single named source for the --collection text banner's "Members:
+        N CVEs" figure — deliberately not len(cves), which is the *filtered*
+        result count once other flags (e.g. --exploits-only) are combined
+        with --collection.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM collection_members WHERE collection_id = ?",
+            (collection_id,),
+        ).fetchone()
+        return row[0]
+
+    def add_to_collection(self, collection_id: int, cve_ids: List[str]) -> tuple:
+        """Add CVE IDs (already normalized) to a collection.
+
+        Returns (added, skipped) — skipped holds any CVE ID not present in
+        the cves table (doc's edge case: warn and continue, don't crash).
+        INSERT OR IGNORE makes re-adding an existing member a no-op at the
+        (collection_id, cve_id) primary key.
+        """
+        added, skipped = [], []
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        for cve_id in cve_ids:
+            if self.get_cve_by_id(cve_id) is None:
+                skipped.append(cve_id)
+                continue
+            self.conn.execute(
+                "INSERT OR IGNORE INTO collection_members (collection_id, cve_id, added_at) "
+                "VALUES (?, ?, ?)",
+                (collection_id, cve_id, now),
+            )
+            added.append(cve_id)
+        if added:
+            self.conn.execute(
+                "UPDATE collections SET updated_at = ? WHERE id = ?", (now, collection_id)
+            )
+        self.conn.commit()
+        return added, skipped
+
+    def remove_from_collection(self, collection_id: int, cve_id: str) -> bool:
+        """Remove one CVE from a collection. Returns True if a row was actually deleted."""
+        cursor = self.conn.execute(
+            "DELETE FROM collection_members WHERE collection_id = ? AND cve_id = ?",
+            (collection_id, cve_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def delete_collection(self, collection_id: int):
+        """Delete a collection; membership rows cascade via the FK (PRAGMA foreign_keys=ON)."""
+        self.conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+        self.conn.commit()
+
+    def rename_collection(self, collection_id: int, new_name: str):
+        """Rename a collection. See create_collection() for the IntegrityError handling."""
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            self.conn.execute(
+                "UPDATE collections SET name = ?, updated_at = ? WHERE id = ?",
+                (new_name, now, collection_id),
+            )
+            self.conn.commit()
+        except sqlite3.IntegrityError:
+            print(f"Collection already exists: {new_name}", file=sys.stderr)
+            sys.exit(1)
+
+    def get_collections_for_cve(self, cve_id: str) -> List[str]:
+        """Names of every collection cve_id belongs to, alphabetically. Feeds format_cve_detail()."""
+        rows = self.conn.execute("""
+            SELECT c.name FROM collections c
+            JOIN collection_members m ON m.collection_id = c.id
+            WHERE m.cve_id = ?
+            ORDER BY c.name
+        """, (cve_id,)).fetchall()
+        return [row[0] for row in rows]
 
     def get_cve_by_id(self, cve_id: str):
         """Return the single cves row for cve_id, or None if not found."""
@@ -402,20 +600,43 @@ class CVEReporter:
             row[col] = self._parse_json_field(row.get(col))
         return row
 
-    def format_list_text(self, cves: List[sqlite3.Row], title: str) -> str:
-        """Render a list of CVEs as the classic banner + per-CVE text report."""
-        if not cves:
+    def format_list_text(self, cves: List[sqlite3.Row], title: str,
+                          collection_info: Optional[Dict] = None) -> str:
+        """Render a list of CVEs as a banner + per-CVE text report.
+
+        When collection_info is given ({name, description, member_count,
+        filters}), renders the specialized COLLECTION/Description/Members/
+        Filters banner from the collections feature instead of the generic
+        banner. `filters` is a pre-joined string of any *other* active
+        filters (deliberately not derived from `title`, which — when a
+        collection is active — already has "Collection: X |" prefixed onto
+        it for the csv/html headers; reusing it here would duplicate the
+        collection name in the Filters line). When collection_info is None
+        (the default), behavior is unchanged from before that feature
+        existed.
+        """
+        if not cves and collection_info is None:
             return "No CVEs found matching the specified filters."
 
         output = []
         output.append("=" * 70)
-        output.append(title)
-        output.append("=" * 70)
-        output.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        output.append(f"Total CVEs: {len(cves)}")
+        if collection_info:
+            output.append(f"COLLECTION: {collection_info['name']}")
+            if collection_info.get('description'):
+                output.append(f"Description: {collection_info['description']}")
+            filters_str = collection_info.get('filters') or "none"
+            output.append(f"Members: {collection_info['member_count']} CVEs  |  Filters: {filters_str}")
+            output.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            output.append(title)
+            output.append("=" * 70)
+            output.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            output.append(f"Total CVEs: {len(cves)}")
         output.append("=" * 70)
         output.append("")
 
+        if not cves:
+            output.append("No CVEs found matching the specified filters.")
         for cve in cves:
             output.append(self.format_cve_text(cve))
             output.append("-" * 70)
@@ -685,10 +906,12 @@ applyFilterAndSort();
             f"Generated: {generated} | Filter: {title} | {len(cves)} CVEs"
         )
 
-        page = self._HTML_TEMPLATE
-        page = page.replace('___DATA_JSON___', data_json)
-        page = page.replace('___HEADER___', header)
-        return page
+        # Single pass over the pristine template via re.sub's callback form —
+        # see _HTML_TOKEN_RE's comment for why chained str.replace() calls
+        # are unsafe here (a data/header value containing a token's literal
+        # text would get corrupted by a subsequent replace).
+        replacements = {'___DATA_JSON___': data_json, '___HEADER___': header}
+        return _HTML_TOKEN_RE.sub(lambda m: replacements[m.group(0)], self._HTML_TEMPLATE)
 
     def format_cve_text(self, cve: sqlite3.Row) -> str:
         """Format a single CVE as text"""
@@ -745,8 +968,12 @@ applyFilterAndSort();
             'last_updated_date': cve['last_updated_date']
         }
     
-    def format_cve_detail(self, cve: sqlite3.Row) -> str:
-        """Format a single CVE as a full seven-section detail view for terminal output."""
+    def format_cve_detail(self, cve: sqlite3.Row, collections: Optional[List[str]] = None) -> str:
+        """Format a single CVE as a full seven-section detail view for terminal output.
+
+        collections is the list of collection names this CVE belongs to
+        (from get_collections_for_cve()); shown in the IDENTITY section.
+        """
         SEP  = "=" * 70
         DASH = "-" * 70
         generated = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -774,6 +1001,7 @@ applyFilterAndSort();
         out.append(f"Severity:        {severity}  (CVSS Score: {score})")
         out.append(f"Published:       {cve['published_date']}")
         out.append(f"Last Updated:    {cve['last_updated_date'] or '(not populated)'}")
+        out.append(f"Collections:     {', '.join(collections) if collections else '(none)'}")
         out.append("")
 
         # ── 3. DESCRIPTION ─────────────────────────────────────────────────────
@@ -888,11 +1116,14 @@ applyFilterAndSort();
         return json.dumps(record, indent=2, default=str)
 
     def generate_report(self, cves: List[sqlite3.Row], title: str, filter_meta: Dict,
-                       output_format: str = 'text', filename: Optional[str] = None):
+                       output_format: str = 'text', filename: Optional[str] = None,
+                       collection_info: Optional[Dict] = None):
         """Dispatch to the appropriate format_list_* method and write the result.
 
         filter_meta is only consumed by the json format (it becomes the
         "filter" key); text/csv/html use the human-readable `title` string.
+        collection_info is only consumed by the text format (see
+        format_list_text) and is None outside the --collection + text case.
         """
         if output_format == 'json':
             output = self.format_list_json(cves, filter_meta)
@@ -901,7 +1132,7 @@ applyFilterAndSort();
         elif output_format == 'html':
             output = self.format_list_html(cves, title)
         else:  # text
-            output = self.format_list_text(cves, title)
+            output = self.format_list_text(cves, title, collection_info=collection_info)
 
         write_output(output, filename)
 
@@ -984,6 +1215,24 @@ def _validate_category(category: str) -> str:
     return normalized
 
 
+def _resolve_collection_id(reporter: 'CVEReporter', name: str) -> int:
+    """Resolve a collection name to its id, or print an error and exit 1.
+
+    Shared by every name-based collection entry point (--collection,
+    --add-to-collection, --remove-from-collection, --delete-collection,
+    --rename-collection's OLD) so they all fail identically on an unknown name.
+    """
+    collection_id = reporter.get_collection_id(name)
+    if collection_id is None:
+        print(
+            f"Collection not found: {name}\n"
+            f"Run --list-collections to see available collections.",
+            file=sys.stderr
+        )
+        sys.exit(1)
+    return collection_id
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='ThreatPulse - Continuous CVE threat monitoring and reporting tool',
@@ -1022,6 +1271,16 @@ Output options:
   %(prog)s --new --mark-processed        # Mark shown CVEs as processed
   %(prog)s --dashboard                    # Show dashboard summary (text only)
   %(prog)s --cve CVE-2026-12345 --format csv  # Single CVE detail as CSV/HTML too
+
+Collections / Watchlists:
+  %(prog)s --create-collection "Log4j variants" --description "Tracking Log4Shell family"
+  %(prog)s --list-collections
+  %(prog)s --add-to-collection "Log4j variants" CVE-2021-44228 CVE-2021-45046
+  %(prog)s --remove-from-collection "Log4j variants" CVE-2021-44228
+  %(prog)s --rename-collection "Log4j variants" "Log4Shell Family"
+  %(prog)s --delete-collection "Log4j variants"
+  %(prog)s --collection "Q3 Red Team" --exploits-only   # Composes with any filter
+  %(prog)s --collection "Log4j variants" --mark-processed
 
 Cron usage:
   */30 * * * * /usr/bin/python /opt/threatpulse/cve_reporter.py \\
@@ -1063,7 +1322,25 @@ Cron usage:
                        help='Show dashboard summary')
     parser.add_argument('--cve', type=str, metavar='CVE-ID',
                        help='Display full detail for a specific CVE ID (e.g. CVE-2026-12345)')
-    
+
+    # Collections / Watchlists (see docs/features/COLLECTIONS_WATCHLISTS_FEATURE.md)
+    parser.add_argument('--collection', type=str, metavar='NAME',
+                       help='Filter: show only CVEs in this named collection (composable with any other filter)')
+    parser.add_argument('--create-collection', type=str, metavar='NAME',
+                       help='Create a new collection')
+    parser.add_argument('--description', type=str,
+                       help='Optional description for --create-collection')
+    parser.add_argument('--list-collections', action='store_true',
+                       help='List all collections with member counts')
+    parser.add_argument('--add-to-collection', nargs='+', metavar=('NAME', 'CVE_ID'),
+                       help='Add one or more CVEs to a collection')
+    parser.add_argument('--remove-from-collection', nargs=2, metavar=('NAME', 'CVE_ID'),
+                       help='Remove a CVE from a collection')
+    parser.add_argument('--delete-collection', type=str, metavar='NAME',
+                       help='Delete a collection (does not delete the CVEs themselves)')
+    parser.add_argument('--rename-collection', nargs=2, metavar=('OLD', 'NEW'),
+                       help='Rename a collection')
+
     # Options
     parser.add_argument('--hours', type=int, default=24,
                        help='Hours to look back (default: 24)')
@@ -1077,10 +1354,108 @@ Cron usage:
     
     args = parser.parse_args()
 
+    # The collection-management mutation actions never consume --output (per
+    # the doc's CLI design, they print a plain confirmation/warning); route
+    # around them so a stray/invalid --output value doesn't spuriously block
+    # a command that would never have touched it.
+    _uses_output = not any([
+        args.create_collection, args.add_to_collection,
+        args.remove_from_collection, args.delete_collection, args.rename_collection,
+    ])
+
     # Fail fast on an unwritable --output path, before any report is generated,
-    # for every mode below (--cve, --dashboard, filtered-query).
-    if args.output:
+    # for every mode below that actually writes to it (--cve, --dashboard,
+    # --list-collections, filtered-query).
+    if args.output and _uses_output:
         _check_output_writable(args.output)
+
+    # --- Collection management actions ---
+    # Priority-checked at the top of main(), same convention as --cve/--dashboard
+    # below (no formal argparse mutex group — first recognized flag wins).
+
+    if args.create_collection:
+        with CVEReporter() as reporter:
+            if reporter.get_collection_id(args.create_collection) is not None:
+                print(f"Collection already exists: {args.create_collection}", file=sys.stderr)
+                sys.exit(1)
+            reporter.create_collection(args.create_collection, args.description)
+            print(f"Created collection '{args.create_collection}'")
+        sys.exit(0)
+
+    if args.list_collections:
+        if args.format != 'text':
+            print(
+                "Error: --list-collections currently only supports --format text "
+                "(json/csv/html are not yet implemented for --list-collections).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        with CVEReporter() as reporter:
+            collections = reporter.list_collections()
+            if not collections:
+                write_output(
+                    "No collections found. Create one with --create-collection <name>.",
+                    args.output,
+                )
+                sys.exit(0)
+            lines = ["COLLECTIONS", "=" * 70]
+            name_width = max(len(c['name']) for c in collections)
+            for c in collections:
+                line = f"  {c['name'].ljust(name_width)}   {c['member_count']:>3} CVEs   Created {c['created_at']}"
+                if c['description']:
+                    line += f'   "{c["description"]}"'
+                lines.append(line)
+            lines.append("=" * 70)
+            lines.append(f"Total: {len(collections)} collections")
+            write_output("\n".join(lines), args.output)
+        sys.exit(0)
+
+    if args.add_to_collection:
+        if len(args.add_to_collection) < 2:
+            print(
+                "Error: --add-to-collection requires a collection name and at least one CVE ID.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        name, raw_ids = args.add_to_collection[0], args.add_to_collection[1:]
+        with CVEReporter() as reporter:
+            collection_id = _resolve_collection_id(reporter, name)
+            cve_ids = [normalize_cve_id(c) for c in raw_ids]
+            added, skipped = reporter.add_to_collection(collection_id, cve_ids)
+            for cve_id in skipped:
+                print(f"{cve_id} not found in database — skipped", file=sys.stderr)
+            print(f"Added {len(added)} CVE(s) to '{name}'")
+        sys.exit(0)
+
+    if args.remove_from_collection:
+        name, raw_id = args.remove_from_collection
+        cve_id = normalize_cve_id(raw_id)
+        with CVEReporter() as reporter:
+            collection_id = _resolve_collection_id(reporter, name)
+            removed = reporter.remove_from_collection(collection_id, cve_id)
+            if removed:
+                print(f"Removed {cve_id} from '{name}'")
+            else:
+                print(f"{cve_id} was not in '{name}'")
+        sys.exit(0)
+
+    if args.delete_collection:
+        with CVEReporter() as reporter:
+            collection_id = _resolve_collection_id(reporter, args.delete_collection)
+            reporter.delete_collection(collection_id)
+            print(f"Deleted collection '{args.delete_collection}'")
+        sys.exit(0)
+
+    if args.rename_collection:
+        old_name, new_name = args.rename_collection
+        with CVEReporter() as reporter:
+            collection_id = _resolve_collection_id(reporter, old_name)
+            if reporter.get_collection_id(new_name) is not None:
+                print(f"Collection already exists: {new_name}", file=sys.stderr)
+                sys.exit(1)
+            reporter.rename_collection(collection_id, new_name)
+            print(f"Renamed '{old_name}' to '{new_name}'")
+        sys.exit(0)
 
     # CVE detail lookup
     if args.cve:
@@ -1098,7 +1473,8 @@ Cron usage:
             elif args.format == 'html':
                 output = reporter.format_list_html([cve], f"CVE Detail: {cve_id}")
             else:
-                output = reporter.format_cve_detail(cve)
+                collections = reporter.get_collections_for_cve(cve_id)
+                output = reporter.format_cve_detail(cve, collections=collections)
             write_output(output, args.output)
             if args.mark_processed:
                 reporter.mark_as_processed([cve_id])
@@ -1124,6 +1500,11 @@ Cron usage:
         # Validate --category early so invalid names exit before any query
         category = _validate_category(args.category) if args.category else None
 
+        # Resolve --collection name to id the same way --category is validated
+        # above; not-found uses the shared error (also used by the collection
+        # management actions higher up in main()).
+        collection_id = _resolve_collection_id(reporter, args.collection) if args.collection else None
+
         # Resolve deprecated aliases — OR with modern equivalents so that
         # --with-exploits and --with-pocs still work and pass the no_flags check
         exploits_only  = bool(args.exploits_only) or bool(args.with_exploits)
@@ -1135,7 +1516,7 @@ Cron usage:
         # Detect whether any actionable flag was supplied
         no_flags = not any([args.new, args.updated, args.unprocessed, args.relevant,
                             args.since, args.critical, severities, category,
-                            args.asset, exploits_only, pocs_only_flag])
+                            args.asset, exploits_only, pocs_only_flag, collection_id])
         if no_flags:
             parser.print_help()
             return
@@ -1153,6 +1534,7 @@ Cron usage:
             asset=args.asset,
             exploits_only=exploits_only,
             pocs_only=pocs_only_flag,
+            collection_id=collection_id,
         )
 
         cursor = reporter.conn.cursor()
@@ -1191,7 +1573,15 @@ Cron usage:
         if pocs_only_flag:
             title_parts.append("POCs Only")
 
+        # Deliberately never append a "Collection: X" entry to title_parts —
+        # title_parts is reused verbatim (unmodified) as the "Filters: ..."
+        # line of the specialized --collection text banner below, and mixing
+        # the collection name into it would both duplicate the banner's own
+        # "COLLECTION: {name}" line and require fragile after-the-fact
+        # removal for that banner's Filters line.
         title = "CVEs — " + " | ".join(title_parts) if title_parts else "All CVEs"
+        if args.collection:
+            title = f"Collection: {args.collection} | {title}"
 
         # Structured filter metadata for --format json's "filter" key. A
         # superset of the illustrative {mode, hours, severity} shape from
@@ -1219,9 +1609,27 @@ Cron usage:
             "asset": args.asset,
             "exploits_only": exploits_only,
             "pocs_only": pocs_only_flag,
+            "collection": args.collection,
         }
 
-        reporter.generate_report(cves, title, filter_meta, args.format, args.output)
+        # Specialized COLLECTION/Description/Members/Filters/Generated banner
+        # for --collection in --format text only (see format_list_text());
+        # every other mode/format keeps using the generic `title` above,
+        # which already carries "Collection: X" when a collection is active.
+        collection_info = None
+        if args.collection and args.format == 'text':
+            collection_row = reporter.conn.execute(
+                "SELECT description FROM collections WHERE id = ?", (collection_id,)
+            ).fetchone()
+            collection_info = {
+                'name': args.collection,
+                'description': collection_row['description'] if collection_row else None,
+                'member_count': reporter.get_collection_member_count(collection_id),
+                'filters': " | ".join(title_parts) if title_parts else None,
+            }
+
+        reporter.generate_report(cves, title, filter_meta, args.format, args.output,
+                                  collection_info=collection_info)
 
         # Mark as processed if requested
         if args.mark_processed and cves:

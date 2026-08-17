@@ -67,6 +67,15 @@ python3 setup.py
 ./cve_reporter.py --new --hours 168        # Last 7 days
 ```
 
+### Collections / Watchlists
+```bash
+./cve_reporter.py --create-collection "Q3 Red Team"
+./cve_reporter.py --add-to-collection "Q3 Red Team" CVE-2021-44228
+./cve_reporter.py --list-collections
+./cve_reporter.py --collection "Q3 Red Team" --exploits-only  # Composes with any filter
+./cve_reporter.py --delete-collection "Q3 Red Team"
+```
+
 ## Output Options
 
 ### Formats
