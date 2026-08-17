@@ -73,12 +73,15 @@ python3 setup.py
 ```bash
 ./cve_reporter.py --new --format text      # Text (default)
 ./cve_reporter.py --new --format json      # JSON
+./cve_reporter.py --new --format csv       # CSV (spreadsheet import)
+./cve_reporter.py --new --format html      # Self-contained HTML table
 ```
 
 ### Save to File
 ```bash
 ./cve_reporter.py --critical --output critical.txt
 ./cve_reporter.py --exploits-only --format json --output exploits.json
+./cve_reporter.py --relevant --format html --output briefing.html
 ```
 
 ## Database Queries (Direct)

@@ -7,8 +7,12 @@ Supports multiple output formats and filtering options.
 """
 
 import sys
+import os
 import sqlite3
 import json
+import csv
+import io
+import html as html_escape_module
 import argparse
 import textwrap
 from datetime import datetime, timedelta
@@ -18,6 +22,74 @@ import config
 def normalize_cve_id(raw: str) -> str:
     """Normalize CVE ID to uppercase canonical form (e.g. cve-2026-1234 → CVE-2026-1234)."""
     return raw.strip().upper()
+
+
+# All columns in the `cves` table, in schema.sql order. Drives full column
+# parity across --format json/csv/html (the output-formats spec requires
+# every DB column to be present in list-based exports).
+CVE_COLUMNS = [
+    'id', 'description', 'published_date', 'last_updated_date',
+    'base_score', 'base_severity',
+    'affects_infrastructure', 'affected_categories', 'affected_assets', 'relevance_score',
+    'has_known_exploit', 'exploit_added_date',
+    'has_poc', 'poc_urls', 'poc_source',
+    'first_seen', 'last_checked', 'processed',
+]
+
+# Columns whose DB representation is a JSON-encoded array string.
+JSON_ARRAY_COLUMNS = {'affected_categories', 'affected_assets', 'poc_urls', 'poc_source'}
+
+# Leading characters that spreadsheet applications (Excel, Sheets, LibreOffice)
+# interpret as the start of a formula. A leading apostrophe neutralizes this
+# without altering the visible cell value.
+_CSV_FORMULA_TRIGGERS = ('=', '+', '-', '@', '\t', '\r')
+
+
+def _csv_safe(value) -> str:
+    """Stringify a CSV cell value, neutralizing formula-injection payloads.
+
+    If the stringified value starts with a character a spreadsheet app would
+    treat as a formula prefix, prepend a single quote so it's rendered as
+    inert text instead of being evaluated.
+    """
+    s = '' if value is None else str(value)
+    if s.startswith(_CSV_FORMULA_TRIGGERS):
+        return "'" + s
+    return s
+
+
+def write_output(content: str, path: Optional[str] = None):
+    """Write `content` to `path` if given, else print it to stdout.
+
+    No confirmation message is printed on success — callers that write a
+    report to a file must produce zero stdout output, so piping/redirecting
+    stdout always yields exactly the requested format and nothing else.
+    """
+    if path:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+    else:
+        print(content)
+
+
+def _check_output_writable(path: str):
+    """Verify `path` is writable before any report generation begins.
+
+    Deliberately avoids creating a file as a side effect of the check (an
+    `open(path, 'a')` probe would silently leave a zero-byte file behind
+    even if the run later aborts for an unrelated reason). If `path` exists,
+    checks it directly; otherwise checks that its parent directory exists
+    and is writable. Prints an error and exits 1 on failure.
+    """
+    if os.path.exists(path):
+        writable = os.access(path, os.W_OK)
+    else:
+        directory = os.path.dirname(path) or '.'
+        writable = os.path.isdir(directory) and os.access(directory, os.W_OK)
+
+    if not writable:
+        print(f"Error: cannot write to output path '{path}'", file=sys.stderr)
+        sys.exit(1)
 
 
 class CVEReporter:
@@ -315,6 +387,309 @@ class CVEReporter:
         except (json.JSONDecodeError, TypeError):
             return []
 
+    def _row_to_export_dict(self, cve: sqlite3.Row) -> Dict:
+        """Convert a full DB row into an export-ready dict.
+
+        All CVE_COLUMNS are included with their raw DB values (no bool()
+        coercion — has_known_exploit etc. stay as 0/1 ints, matching the
+        --format json contract) except for JSON_ARRAY_COLUMNS, which are
+        parsed into native lists. This is the single source of truth behind
+        --format json/csv/html so the three formats never drift from each
+        other's idea of "the full record".
+        """
+        row = dict(cve)
+        for col in JSON_ARRAY_COLUMNS:
+            row[col] = self._parse_json_field(row.get(col))
+        return row
+
+    def format_list_text(self, cves: List[sqlite3.Row], title: str) -> str:
+        """Render a list of CVEs as the classic banner + per-CVE text report."""
+        if not cves:
+            return "No CVEs found matching the specified filters."
+
+        output = []
+        output.append("=" * 70)
+        output.append(title)
+        output.append("=" * 70)
+        output.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        output.append(f"Total CVEs: {len(cves)}")
+        output.append("=" * 70)
+        output.append("")
+
+        for cve in cves:
+            output.append(self.format_cve_text(cve))
+            output.append("-" * 70)
+
+        return "\n".join(output)
+
+    def format_list_json(self, cves: List[sqlite3.Row], filter_meta: Dict) -> str:
+        """Render a list of CVEs as the structured JSON export.
+
+        Shape: {generated_at, filter, count, cves: [...]} with every CVE
+        expanded to its full column set via _row_to_export_dict(). Valid
+        (non-crashing) on an empty result set: count=0, cves=[].
+        """
+        report = {
+            'generated_at': datetime.now().isoformat(),
+            'filter': filter_meta,
+            'count': len(cves),
+            'cves': [self._row_to_export_dict(cve) for cve in cves],
+        }
+        return json.dumps(report, indent=2, default=str)
+
+    def format_list_csv(self, cves: List[sqlite3.Row], title: str) -> str:
+        """Render a list of CVEs as a flat CSV with a leading comment line.
+
+        Header row always uses the full CVE_COLUMNS set (DB column names) so
+        the file has a predictable shape even on an empty result set.
+        Multi-value (JSON array) fields are pipe-delimited. Every cell is
+        passed through _csv_safe() to neutralize spreadsheet formula
+        injection; csv.writer's default QUOTE_MINIMAL handles commas/quotes/
+        newlines (e.g. in `description`).
+        """
+        generated = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        buf = io.StringIO()
+        buf.write(f"# Generated: {generated}  |  Filter: {title}  |  Count: {len(cves)}\n")
+
+        writer = csv.writer(buf)
+        writer.writerow(CVE_COLUMNS)
+
+        for cve in cves:
+            row = self._row_to_export_dict(cve)
+            values = []
+            for col in CVE_COLUMNS:
+                val = row.get(col)
+                if col in JSON_ARRAY_COLUMNS:
+                    val = '|'.join(val) if val else ''
+                values.append(_csv_safe(val))
+            writer.writerow(values)
+
+        return buf.getvalue()
+
+    _HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ThreatPulse CVE Report</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #1a1d29; --border: #2a2e3d; --text: #e5e7eb;
+    --muted: #9aa1b1; --accent: #6ea8ff;
+    --critical: #ff5c5c; --high: #ff9f43; --medium: #ffd93d; --low: #9aa1b1;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    margin: 0; padding: 24px;
+  }
+  h1 { margin: 0 0 4px 0; font-size: 22px; }
+  .meta { color: var(--muted); margin: 0 0 20px 0; font-size: 13px; }
+  #search {
+    width: 100%; max-width: 420px; padding: 8px 12px; margin-bottom: 16px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); font-size: 14px;
+  }
+  table { width: 100%; border-collapse: collapse; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border);
+    font-size: 13px; vertical-align: top; }
+  th { cursor: pointer; user-select: none; color: var(--muted); font-weight: 600;
+    white-space: nowrap; }
+  th:hover { color: var(--text); }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: rgba(110,168,255,0.06); }
+  tbody tr.empty:hover { background: none; cursor: default; }
+  .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 11px;
+    font-weight: 600; margin-right: 4px; }
+  .badge.exploit { background: rgba(255,92,92,0.15); color: var(--critical); }
+  .badge.poc { background: rgba(110,168,255,0.15); color: var(--accent); }
+  .sev { font-weight: 700; }
+  .sev.CRITICAL { color: var(--critical); }
+  .sev.HIGH { color: var(--high); }
+  .sev.MEDIUM { color: var(--medium); }
+  .sev.LOW, .sev.NONE { color: var(--low); }
+  .detail-row td { background: rgba(255,255,255,0.02); white-space: pre-wrap; }
+  .detail-row a { color: var(--accent); }
+  .detail-row .poc-link { display: block; margin-top: 4px; word-break: break-all; }
+</style>
+</head>
+<body>
+<h1>ThreatPulse CVE Report</h1>
+<p class="meta">___HEADER___</p>
+<input id="search" type="text" placeholder="Search CVEs...">
+<table id="cve-table">
+  <thead>
+    <tr>
+      <th data-key="id">ID</th>
+      <th data-key="base_severity">Severity</th>
+      <th data-key="base_score">Score</th>
+      <th data-key="published_date">Published</th>
+      <th data-key="relevance_score">Relevance</th>
+      <th>Flags</th>
+    </tr>
+  </thead>
+  <tbody id="cve-tbody"></tbody>
+</table>
+<script>
+const DATA = ___DATA_JSON___;
+
+function el(tag, opts) {
+  const node = document.createElement(tag);
+  if (opts) {
+    if (opts.className) node.className = opts.className;
+    if (opts.text !== undefined) node.textContent = opts.text;
+  }
+  return node;
+}
+
+function safeLink(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      const a = el('a', { text: url });
+      a.href = url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.className = 'poc-link';
+      return a;
+    }
+  } catch (e) { /* fall through to plain text */ }
+  return el('span', { text: url + ' (blocked: unsupported URL scheme)', className: 'poc-link' });
+}
+
+function buildDetailContent(cve) {
+  const wrap = el('div');
+  wrap.appendChild(el('div', { text: cve.description || '(no description)' }));
+  const urls = Array.isArray(cve.poc_urls) ? cve.poc_urls : [];
+  urls.forEach(u => wrap.appendChild(safeLink(u)));
+  return wrap;
+}
+
+function buildRow(cve) {
+  const tr = el('tr');
+
+  const idTd = el('td', { text: cve.id });
+  const sevTd = el('td');
+  const sevSpan = el('span', { text: cve.base_severity || 'N/A', className: 'sev ' + (cve.base_severity || 'NONE') });
+  sevTd.appendChild(sevSpan);
+  const scoreTd = el('td', { text: cve.base_score != null ? String(cve.base_score) : 'N/A' });
+  const pubTd = el('td', { text: cve.published_date || '' });
+  const relTd = el('td', { text: cve.relevance_score != null ? String(cve.relevance_score) : '' });
+
+  const flagsTd = el('td');
+  if (cve.has_known_exploit) flagsTd.appendChild(el('span', { text: 'EXPLOIT', className: 'badge exploit' }));
+  if (cve.has_poc) flagsTd.appendChild(el('span', { text: 'POC', className: 'badge poc' }));
+
+  tr.appendChild(idTd); tr.appendChild(sevTd); tr.appendChild(scoreTd);
+  tr.appendChild(pubTd); tr.appendChild(relTd); tr.appendChild(flagsTd);
+
+  const detailTr = el('tr', { className: 'detail-row' });
+  detailTr.style.display = 'none';
+  const detailTd = el('td');
+  detailTd.colSpan = 6;
+  detailTd.appendChild(buildDetailContent(cve));
+  detailTr.appendChild(detailTd);
+
+  tr.addEventListener('click', () => {
+    detailTr.style.display = detailTr.style.display === 'none' ? '' : 'none';
+  });
+
+  return [tr, detailTr];
+}
+
+let sortKey = null;
+let sortAsc = true;
+
+function render(rows) {
+  const tbody = document.getElementById('cve-tbody');
+  tbody.textContent = '';
+  if (rows.length === 0) {
+    const tr = el('tr', { className: 'empty' });
+    const td = el('td', { text: 'No results' });
+    td.colSpan = 6;
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  rows.forEach(cve => {
+    const [tr, detailTr] = buildRow(cve);
+    tbody.appendChild(tr);
+    tbody.appendChild(detailTr);
+  });
+}
+
+function applyFilterAndSort() {
+  const q = document.getElementById('search').value.trim().toLowerCase();
+  let rows = DATA.filter(cve => {
+    if (!q) return true;
+    return JSON.stringify(cve).toLowerCase().includes(q);
+  });
+  if (sortKey) {
+    rows = rows.slice().sort((a, b) => {
+      const av = a[sortKey], bv = b[sortKey];
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      if (av < bv) return sortAsc ? -1 : 1;
+      if (av > bv) return sortAsc ? 1 : -1;
+      return 0;
+    });
+  }
+  render(rows);
+}
+
+document.getElementById('search').addEventListener('input', applyFilterAndSort);
+
+document.querySelectorAll('th[data-key]').forEach(th => {
+  th.addEventListener('click', () => {
+    const key = th.getAttribute('data-key');
+    if (sortKey === key) { sortAsc = !sortAsc; } else { sortKey = key; sortAsc = true; }
+    applyFilterAndSort();
+  });
+});
+
+applyFilterAndSort();
+</script>
+</body>
+</html>
+"""
+
+    def format_list_html(self, cves: List[sqlite3.Row], title: str) -> str:
+        """Render a list of CVEs as a self-contained, sortable/searchable HTML table.
+
+        Security notes:
+          - The embedded JSON blob has '</' escaped to '<\\/' before being
+            written into the <script> tag, so a description containing a
+            literal "</script>" sequence can't terminate the script early
+            and inject live markup.
+          - All per-row rendering in the client-side JS uses
+            document.createElement()/.textContent — never innerHTML or
+            string-built HTML — for any DB-derived value.
+          - poc_urls entries are only rendered as clickable links after the
+            JS validates the URL scheme is http/https; anything else
+            (javascript:, data:, malformed) renders as inert text.
+        """
+        if len(cves) > 1000:
+            print(
+                f"Warning: --format html with {len(cves)} CVEs may render slowly in a browser.",
+                file=sys.stderr,
+            )
+
+        rows_data = [self._row_to_export_dict(cve) for cve in cves]
+        data_json = json.dumps(rows_data, default=str).replace('</', '<\\/')
+        generated = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # title may embed free-form CLI input (e.g. --asset); escape before
+        # inserting into the static HTML shell since ___HEADER___ lands
+        # directly in markup, not in a JS/JSON context like DATA above.
+        header = html_escape_module.escape(
+            f"Generated: {generated} | Filter: {title} | {len(cves)} CVEs"
+        )
+
+        page = self._HTML_TEMPLATE
+        page = page.replace('___DATA_JSON___', data_json)
+        page = page.replace('___HEADER___', header)
+        return page
+
     def format_cve_text(self, cve: sqlite3.Row) -> str:
         """Format a single CVE as text"""
         exploit_flag = "🚨 EXPLOIT AVAILABLE" if cve['has_known_exploit'] else ""
@@ -512,97 +887,75 @@ class CVEReporter:
         record['generated_at'] = generated_at
         return json.dumps(record, indent=2, default=str)
 
-    def generate_report(self, cves: List[sqlite3.Row], title: str, 
+    def generate_report(self, cves: List[sqlite3.Row], title: str, filter_meta: Dict,
                        output_format: str = 'text', filename: Optional[str] = None):
-        """Generate and output/save a report"""
-        
+        """Dispatch to the appropriate format_list_* method and write the result.
+
+        filter_meta is only consumed by the json format (it becomes the
+        "filter" key); text/csv/html use the human-readable `title` string.
+        """
         if output_format == 'json':
-            report_data = {
-                'title': title,
-                'generated_at': datetime.now().isoformat(),
-                'count': len(cves),
-                'cves': [self.format_cve_json(cve) for cve in cves]
-            }
-            
-            if filename:
-                with open(filename, 'w') as f:
-                    json.dump(report_data, f, indent=2)
-                print(f"Report saved to: {filename}")
-            else:
-                print(json.dumps(report_data, indent=2))
-        
-        else:  # text format
-            output = []
-            output.append("=" * 70)
-            output.append(title)
-            output.append("=" * 70)
-            output.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            output.append(f"Total CVEs: {len(cves)}")
-            output.append("=" * 70)
-            output.append("")
-            
-            for cve in cves:
-                output.append(self.format_cve_text(cve))
-                output.append("-" * 70)
-            
-            report_text = "\n".join(output)
-            
-            if filename:
-                with open(filename, 'w') as f:
-                    f.write(report_text)
-                print(f"Report saved to: {filename}")
-            else:
-                print(report_text)
-    
-    def generate_dashboard(self):
-        """Generate dashboard summary"""
+            output = self.format_list_json(cves, filter_meta)
+        elif output_format == 'csv':
+            output = self.format_list_csv(cves, title)
+        elif output_format == 'html':
+            output = self.format_list_html(cves, title)
+        else:  # text
+            output = self.format_list_text(cves, title)
+
+        write_output(output, filename)
+
+    def generate_dashboard(self) -> str:
+        """Build the dashboard summary text and return it (does not print)."""
         stats = self.get_dashboard_stats()
-        
-        print("=" * 70)
-        print("THREATPULSE DASHBOARD")
-        print("=" * 70)
-        print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("")
-        
-        print("OVERALL STATISTICS")
-        print("-" * 70)
-        print(f"Total CVEs in Database: {stats['total_cves']}")
-        print(f"  ├─ Critical: {stats['critical']}")
-        print(f"  ├─ High: {stats['high']}")
-        print(f"  ├─ Medium: {stats['medium']}")
-        print(f"  └─ Low: {stats['low']}")
-        print("")
-        print(f"CVEs with Known Exploits: {stats['with_exploits']}")
-        print(f"CVEs with POC Exploits: {stats['with_pocs']}")
-        print(f"Relevant to Infrastructure: {stats['relevant']}")
-        print(f"Unprocessed CVEs: {stats['unprocessed']}")
-        print("")
-        
-        print("RECENT ACTIVITY (24 HOURS)")
-        print("-" * 70)
-        print(f"New CVEs: {stats['new_24h']}")
-        print(f"Updated CVEs: {stats['updated_24h']}")
-        print("")
-        
-        print("⚠️  CRITICAL ALERTS")
-        print("-" * 70)
-        print(f"High/Critical CVEs with Exploits (Infrastructure): {stats['critical_exploits']}")
+
+        out = []
+        out.append("=" * 70)
+        out.append("THREATPULSE DASHBOARD")
+        out.append("=" * 70)
+        out.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        out.append("")
+
+        out.append("OVERALL STATISTICS")
+        out.append("-" * 70)
+        out.append(f"Total CVEs in Database: {stats['total_cves']}")
+        out.append(f"  ├─ Critical: {stats['critical']}")
+        out.append(f"  ├─ High: {stats['high']}")
+        out.append(f"  ├─ Medium: {stats['medium']}")
+        out.append(f"  └─ Low: {stats['low']}")
+        out.append("")
+        out.append(f"CVEs with Known Exploits: {stats['with_exploits']}")
+        out.append(f"CVEs with POC Exploits: {stats['with_pocs']}")
+        out.append(f"Relevant to Infrastructure: {stats['relevant']}")
+        out.append(f"Unprocessed CVEs: {stats['unprocessed']}")
+        out.append("")
+
+        out.append("RECENT ACTIVITY (24 HOURS)")
+        out.append("-" * 70)
+        out.append(f"New CVEs: {stats['new_24h']}")
+        out.append(f"Updated CVEs: {stats['updated_24h']}")
+        out.append("")
+
+        out.append("⚠️  CRITICAL ALERTS")
+        out.append("-" * 70)
+        out.append(f"High/Critical CVEs with Exploits (Infrastructure): {stats['critical_exploits']}")
         if stats['critical_exploits'] > 0:
-            print("   ⚠️  IMMEDIATE ACTION REQUIRED")
-        print("")
-        
+            out.append("   ⚠️  IMMEDIATE ACTION REQUIRED")
+        out.append("")
+
         if stats['top_assets']:
-            print("TOP AFFECTED ASSETS")
-            print("-" * 70)
+            out.append("TOP AFFECTED ASSETS")
+            out.append("-" * 70)
             for asset_data, count in stats['top_assets'][:5]:
                 try:
                     assets = json.loads(asset_data)
-                    print(f"  {', '.join(assets)}: {count} CVEs")
-                except:
+                    out.append(f"  {', '.join(assets)}: {count} CVEs")
+                except (json.JSONDecodeError, TypeError):
                     pass
-            print("")
-        
-        print("=" * 70)
+            out.append("")
+
+        out.append("=" * 70)
+        return "\n".join(out)
 
 
 def _validate_category(category: str) -> str:
@@ -663,9 +1016,12 @@ Composable examples (flags combine with AND logic):
 
 Output options:
   %(prog)s --new --format json           # Output as JSON
+  %(prog)s --new --format csv            # Output as CSV
+  %(prog)s --new --format html --output report.html  # Self-contained HTML file
   %(prog)s --new --output report.txt     # Save to file
   %(prog)s --new --mark-processed        # Mark shown CVEs as processed
-  %(prog)s --dashboard                    # Show dashboard summary
+  %(prog)s --dashboard                    # Show dashboard summary (text only)
+  %(prog)s --cve CVE-2026-12345 --format csv  # Single CVE detail as CSV/HTML too
 
 Cron usage:
   */30 * * * * /usr/bin/python /opt/threatpulse/cve_reporter.py \\
@@ -711,15 +1067,21 @@ Cron usage:
     # Options
     parser.add_argument('--hours', type=int, default=24,
                        help='Hours to look back (default: 24)')
-    parser.add_argument('--format', choices=['text', 'json'], default='text',
-                       help='Output format (default: text)')
+    parser.add_argument('--format', choices=['text', 'json', 'csv', 'html'], default='text',
+                       help='Output format: text, json, csv, or html (default: text). '
+                            '--dashboard currently supports text only.')
     parser.add_argument('--output', type=str,
                        help='Output filename (default: stdout)')
     parser.add_argument('--mark-processed', action='store_true',
                        help='Mark displayed CVEs as processed')
     
     args = parser.parse_args()
-    
+
+    # Fail fast on an unwritable --output path, before any report is generated,
+    # for every mode below (--cve, --dashboard, filtered-query).
+    if args.output:
+        _check_output_writable(args.output)
+
     # CVE detail lookup
     if args.cve:
         cve_id = normalize_cve_id(args.cve)
@@ -731,22 +1093,29 @@ Cron usage:
                 sys.exit(1)
             if args.format == 'json':
                 output = reporter.format_cve_detail_json(cve)
+            elif args.format == 'csv':
+                output = reporter.format_list_csv([cve], f"CVE Detail: {cve_id}")
+            elif args.format == 'html':
+                output = reporter.format_list_html([cve], f"CVE Detail: {cve_id}")
             else:
                 output = reporter.format_cve_detail(cve)
-            if args.output:
-                with open(args.output, 'w') as f:
-                    f.write(output)
-            else:
-                print(output)
+            write_output(output, args.output)
             if args.mark_processed:
                 reporter.mark_as_processed([cve_id])
-                print(f"\nMarked {cve_id} as processed")
+                print(f"\nMarked {cve_id} as processed", file=sys.stderr)
         sys.exit(0)
 
     # Show dashboard if requested
     if args.dashboard:
+        if args.format != 'text':
+            print(
+                "Error: --dashboard currently only supports --format text "
+                "(json/csv/html are not yet implemented for --dashboard).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         with CVEReporter() as reporter:
-            reporter.generate_dashboard()
+            write_output(reporter.generate_dashboard(), args.output)
         return
     
     # Determine which report to generate
@@ -790,9 +1159,10 @@ Cron usage:
         cursor.execute(sql, params)
         cves = cursor.fetchall()
 
-        if not cves:
-            print("No CVEs found matching the specified filters.")
-            sys.exit(0)
+        # Note: no early-exit on an empty result set here — each
+        # format_list_* method (text/json/csv/html) produces valid,
+        # non-crashing output for cves=[] per the output-formats spec's
+        # edge-case table, and that has to hold for --output too.
 
         # Dynamic title reflecting all active flags
         title_parts = []
@@ -823,13 +1193,41 @@ Cron usage:
 
         title = "CVEs — " + " | ".join(title_parts) if title_parts else "All CVEs"
 
-        reporter.generate_report(cves, title, args.format, args.output)
+        # Structured filter metadata for --format json's "filter" key. A
+        # superset of the illustrative {mode, hours, severity} shape from
+        # the output-formats spec, extended to cover this repo's composable
+        # filters (category/asset/exploits_only/pocs_only) — see
+        # docs/features/OUTPUT_FORMATS_FEATURE.md.
+        if args.new:
+            mode = "new"
+        elif args.updated:
+            mode = "updated"
+        elif args.unprocessed:
+            mode = "unprocessed"
+        elif args.relevant:
+            mode = "relevant"
+        elif args.since:
+            mode = f"since:{args.since}"
+        else:
+            mode = "all"
+
+        filter_meta = {
+            "mode": mode,
+            "hours": args.hours if (args.new or args.updated) else None,
+            "severity": (["CRITICAL"] if args.critical else severities),
+            "category": category,
+            "asset": args.asset,
+            "exploits_only": exploits_only,
+            "pocs_only": pocs_only_flag,
+        }
+
+        reporter.generate_report(cves, title, filter_meta, args.format, args.output)
 
         # Mark as processed if requested
         if args.mark_processed and cves:
             cve_ids = [cve['id'] for cve in cves]
             reporter.mark_as_processed(cve_ids)
-            print(f"\nMarked {len(cve_ids)} CVEs as processed")
+            print(f"\nMarked {len(cve_ids)} CVEs as processed", file=sys.stderr)
 
 
 if __name__ == "__main__":
