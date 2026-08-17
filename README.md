@@ -62,6 +62,7 @@ A modular threat monitoring tool that separates data collection from reporting, 
 - Dashboard summary view
 - Asset-specific reports
 - Single CVE deep-dive lookup (`--cve`)
+- Named collections/watchlists (`--collection`) to group CVEs for a project, independent of any other filter
 
 ### ✅ External Asset Configuration
 - Asset inventory and weights stored in `assets.json` (separate from code)
@@ -256,6 +257,30 @@ If the CVE is not in the database, a not-found message is printed and the comman
 
 # Mark as processed after viewing
 ./cve_reporter.py --unprocessed --mark-processed
+```
+
+#### Collections / Watchlists
+
+Named, ad-hoc sets of CVEs for a project or report — independent of severity/asset/category filters. Composes with any other reporter flag.
+
+```bash
+# Create a collection
+./cve_reporter.py --create-collection "Log4j variants" --description "Tracking Log4Shell family"
+
+# List all collections with member counts
+./cve_reporter.py --list-collections
+
+# Add / remove CVEs
+./cve_reporter.py --add-to-collection "Log4j variants" CVE-2021-44228 CVE-2021-45046
+./cve_reporter.py --remove-from-collection "Log4j variants" CVE-2021-44228
+
+# Rename / delete (deleting a collection does not delete the CVEs themselves)
+./cve_reporter.py --rename-collection "Log4j variants" "Log4Shell Family"
+./cve_reporter.py --delete-collection "Log4Shell Family"
+
+# Report on a collection — composes with any other filter/format/output flag
+./cve_reporter.py --collection "Q3 Red Team" --exploits-only
+./cve_reporter.py --collection "Customer XYZ" --format json --output customer_xyz.json
 ```
 
 ## Database Schema

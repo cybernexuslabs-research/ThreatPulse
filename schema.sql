@@ -50,7 +50,7 @@ CREATE INDEX IF NOT EXISTS idx_poc ON cves(has_poc, base_score DESC);
 
 -- View for quick stats
 CREATE VIEW IF NOT EXISTS cve_stats AS
-SELECT 
+SELECT
     COUNT(*) as total_cves,
     SUM(CASE WHEN base_severity = 'CRITICAL' THEN 1 ELSE 0 END) as critical_count,
     SUM(CASE WHEN base_severity = 'HIGH' THEN 1 ELSE 0 END) as high_count,
@@ -61,3 +61,27 @@ SELECT
     SUM(CASE WHEN processed = 0 THEN 1 ELSE 0 END) as unprocessed_count,
     SUM(CASE WHEN has_poc = 1 THEN 1 ELSE 0 END) as poc_count
 FROM cves;
+
+-- Collections / Watchlists: named, ad-hoc sets of CVEs (see
+-- docs/features/COLLECTIONS_WATCHLISTS_FEATURE.md). Both FK columns on
+-- collection_members cascade on delete — collection_id so deleting a
+-- collection cleans up its membership rows, and cve_id so a CVE removed
+-- from `cves` (were that ever to happen) doesn't leave orphaned membership
+-- rows behind. Enforced only when the connection has run
+-- `PRAGMA foreign_keys = ON` (see CVEReporter.__enter__ in cve_reporter.py).
+CREATE TABLE IF NOT EXISTS collections (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS collection_members (
+    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    cve_id        TEXT    NOT NULL REFERENCES cves(id) ON DELETE CASCADE,
+    added_at      TEXT    NOT NULL,
+    PRIMARY KEY (collection_id, cve_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_collection_members_cve ON collection_members(cve_id);
