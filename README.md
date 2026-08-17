@@ -58,7 +58,7 @@ A modular threat monitoring tool that separates data collection from reporting, 
 
 ### ✅ Flexible Reporting
 - CLI with multiple filtering options
-- Text and JSON output formats
+- Text, JSON, CSV, and self-contained HTML output formats
 - Dashboard summary view
 - Asset-specific reports
 - Single CVE deep-dive lookup (`--cve`)
@@ -247,6 +247,12 @@ If the CVE is not in the database, a not-found message is printed and the comman
 
 # JSON to file
 ./cve_reporter.py --exploits-only --format json --output exploits.json
+
+# CSV for spreadsheet import
+./cve_reporter.py --critical --format csv --output critical_cves.csv
+
+# Self-contained HTML briefing (sortable/searchable table, opens in any browser)
+./cve_reporter.py --relevant --format html --output briefing.html
 
 # Mark as processed after viewing
 ./cve_reporter.py --unprocessed --mark-processed
