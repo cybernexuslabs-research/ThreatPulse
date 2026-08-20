@@ -76,6 +76,13 @@ python3 setup.py
 ./cve_reporter.py --delete-collection "Q3 Red Team"
 ```
 
+### Lifecycle Timeline & Velocity
+```bash
+./cve_reporter.py --cve CVE-2026-12345 --timeline    # Full event log (requires --cve, text only)
+./cve_reporter.py --exploits-only --velocity          # Sort by speed to exploit (fastest first)
+./cve_reporter.py --exploits-only --max-days-to-exploit 7  # Weaponized within a week
+```
+
 ## Output Options
 
 ### Formats

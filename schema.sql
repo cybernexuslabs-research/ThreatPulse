@@ -85,3 +85,33 @@ CREATE TABLE IF NOT EXISTS collection_members (
 );
 
 CREATE INDEX IF NOT EXISTS idx_collection_members_cve ON collection_members(cve_id);
+
+-- Lifecycle event log: append-only audit trail of per-CVE events (see
+-- docs/features/TIMELINE_VIEW_FEATURE.md). Written by the collector on
+-- ingest/score/exploit/POC transitions, and by the reporter when a CVE is
+-- marked processed. event_date is local time (datetime.now().isoformat()),
+-- matching every other timestamp column in this schema (first_seen,
+-- last_checked, collections.created_at, etc.) — not UTC as the design doc's
+-- pseudocode originally suggested, to keep duration math against
+-- published_date/first_seen consistent within one timezone convention.
+-- detail is a JSON blob with event-specific fields (see the design doc's
+-- event type table for examples per event_type).
+--
+-- Unlike the doc's literal DDL, the FK cascades on delete (ON DELETE
+-- CASCADE), for the same reason collection_members does: if a CVE row is
+-- ever removed from `cves`, its event history shouldn't be left behind as
+-- orphaned rows. Enforced only when the connection has run
+-- `PRAGMA foreign_keys = ON` (see CVEReporter.__enter__ in cve_reporter.py) —
+-- events are written from both cve_collector.py (which does not currently
+-- set that pragma) and cve_reporter.py (which does), so treat the FK as
+-- documentation of intent rather than a guarantee in all write paths.
+CREATE TABLE IF NOT EXISTS cve_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    cve_id      TEXT NOT NULL REFERENCES cves(id) ON DELETE CASCADE,
+    event_type  TEXT NOT NULL,   -- ingested | cvss_changed | kev_added | poc_added | poc_updated | processed
+    event_date  TEXT NOT NULL,   -- ISO 8601 datetime, local time
+    detail      TEXT             -- JSON blob with event-specific data
+);
+
+CREATE INDEX IF NOT EXISTS idx_cve_events_cve_id ON cve_events(cve_id);
+CREATE INDEX IF NOT EXISTS idx_cve_events_type   ON cve_events(event_type);

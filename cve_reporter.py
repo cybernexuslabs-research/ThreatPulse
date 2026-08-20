@@ -19,10 +19,65 @@ import textwrap
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import config
+from events import record_event
 
 def normalize_cve_id(raw: str) -> str:
     """Normalize CVE ID to uppercase canonical form (e.g. cve-2026-1234 → CVE-2026-1234)."""
     return raw.strip().upper()
+
+
+def days_to_exploit(published_date: Optional[str], events: List[Dict]) -> Optional[timedelta]:
+    """Time from NVD publication to the first sign of active exploitation.
+
+    Anchored on `cves.published_date` (the actual NVD disclosure date) —
+    not the `ingested` event's timestamp, which is what the design doc's
+    original pseudocode used. `ingested` only records when *this collector*
+    first observed the CVE, which lags real disclosure by however stale
+    that particular collector run was, and doesn't exist at all for CVEs
+    ingested before this feature shipped. published_date is present on
+    every row regardless, so this covers those pre-feature CVEs too, the
+    moment they earn a kev_added/poc_added event.
+
+    "First sign of exploitation" is the earliest kev_added or poc_added
+    event (exploit_confirmed was collapsed into kev_added in the collector —
+    see cve_collector.py's _record_lifecycle_events — there's only one
+    exploit-signal event type to look for here).
+
+    Returns None if there's no published_date, no qualifying event, or
+    either timestamp fails to parse (defensive against malformed/legacy data
+    rather than raising out of a report-generation path).
+    """
+    if not published_date:
+        return None
+    exploit_events = [e for e in events if e['event_type'] in ('kev_added', 'poc_added')]
+    if not exploit_events:
+        return None
+    first = min(exploit_events, key=lambda e: e['event_date'])
+    try:
+        pub = datetime.fromisoformat(published_date)
+        first_dt = datetime.fromisoformat(first['event_date'])
+    except (ValueError, TypeError):
+        return None
+    return first_dt - pub
+
+
+def _format_duration(delta: timedelta) -> str:
+    """Human-readable duration for display: '5 days', '3 hours', '2 days 4 hours'.
+
+    Shared by format_cve_detail()'s LIFECYCLE TIMELINE section and the
+    --velocity list-view line, so both surfaces render a days_to_exploit()
+    result identically.
+    """
+    total_seconds = max(delta.total_seconds(), 0)
+    days = int(total_seconds // 86400)
+    hours = int((total_seconds % 86400) // 3600)
+    if days > 0 and hours > 0:
+        return f"{days} day{'s' if days != 1 else ''} {hours} hour{'s' if hours != 1 else ''}"
+    elif days > 0:
+        return f"{days} day{'s' if days != 1 else ''}"
+    elif hours > 0:
+        return f"{hours} hour{'s' if hours != 1 else ''}"
+    return "less than an hour"
 
 
 # All columns in the `cves` table, in schema.sql order. Drives full column
@@ -67,6 +122,27 @@ CREATE TABLE IF NOT EXISTS collection_members (
 );
 
 CREATE INDEX IF NOT EXISTS idx_collection_members_cve ON collection_members(cve_id);
+"""
+
+# Lifecycle event log (see docs/features/TIMELINE_VIEW_FEATURE.md). Inlined
+# for the same reason _COLLECTIONS_SCHEMA_SQL is: the reporter must not
+# depend on schema.sql being present, or on cve_collector.py's
+# migrate_database() having already run against this DB. Kept in sync with
+# the CREATE TABLE/INDEX statements appended to schema.sql; both use IF NOT
+# EXISTS. The FK cascades on delete for the same reason collection_members'
+# does — a CVE removed from `cves` shouldn't leave orphaned event rows —
+# and only fires with PRAGMA foreign_keys = ON (see CVEReporter.__enter__).
+_CVE_EVENTS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS cve_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    cve_id      TEXT NOT NULL REFERENCES cves(id) ON DELETE CASCADE,
+    event_type  TEXT NOT NULL,
+    event_date  TEXT NOT NULL,
+    detail      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_cve_events_cve_id ON cve_events(cve_id);
+CREATE INDEX IF NOT EXISTS idx_cve_events_type   ON cve_events(event_type);
 """
 
 # Matches the placeholder tokens in CVEReporter._HTML_TEMPLATE. Used with
@@ -149,15 +225,18 @@ class CVEReporter:
         # retry briefly instead of immediately raising "database is locked"
         # if a report happens to race a collector write.
         self.conn.execute("PRAGMA busy_timeout = 5000")
-        self._ensure_collections_schema()
+        self._ensure_table_schema('collections', _COLLECTIONS_SCHEMA_SQL)
+        self._ensure_table_schema('cve_events', _CVE_EVENTS_SCHEMA_SQL)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.conn:
             self.conn.close()
 
-    def _ensure_collections_schema(self):
-        """Create the collections/collection_members tables if missing.
+    def _ensure_table_schema(self, table_name: str, schema_sql: str):
+        """Create `table_name` (and whatever it's defined alongside — sibling
+        tables/indexes in `schema_sql`, e.g. collections+collection_members)
+        if `table_name` doesn't exist yet.
 
         Checks sqlite_master first (a plain indexed read, no write lock)
         rather than unconditionally running CREATE TABLE IF NOT EXISTS on
@@ -166,12 +245,13 @@ class CVEReporter:
         a write lock even when it ends up being a no-op.
         """
         exists = self.conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='collections'"
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,)
         ).fetchone()
         if exists is None:
-            self.conn.executescript(_COLLECTIONS_SCHEMA_SQL)
+            self.conn.executescript(schema_sql)
             self.conn.commit()
-    
+
     def get_new_cves(self, hours: int = 24) -> List[sqlite3.Row]:
         """Get CVEs added in the last N hours"""
         cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
@@ -502,6 +582,47 @@ class CVEReporter:
         """, (cve_id,)).fetchall()
         return [row[0] for row in rows]
 
+    def get_events_for_cve(self, cve_id: str) -> List[Dict]:
+        """Lifecycle events for one CVE, chronological order. Feeds --timeline
+        and days_to_exploit(). Same plain SELECT shape as get_collections_for_cve().
+        """
+        rows = self.conn.execute("""
+            SELECT event_type, event_date, detail FROM cve_events
+            WHERE cve_id = ?
+            ORDER BY event_date ASC, id ASC
+        """, (cve_id,)).fetchall()
+        return [
+            {
+                'event_type': row['event_type'],
+                'event_date': row['event_date'],
+                'detail': json.loads(row['detail']) if row['detail'] else {},
+            }
+            for row in rows
+        ]
+
+    def get_events_for_cves(self, cve_ids: List[str]) -> Dict[str, List[Dict]]:
+        """Batched get_events_for_cve() for --velocity's candidate-row set —
+        one query instead of one per CVE. Feeds days_to_exploit() per row.
+        A CVE with no events is simply absent from the result, not mapped
+        to an empty list.
+        """
+        if not cve_ids:
+            return {}
+        placeholders = ','.join('?' * len(cve_ids))
+        rows = self.conn.execute(f"""
+            SELECT cve_id, event_type, event_date, detail FROM cve_events
+            WHERE cve_id IN ({placeholders})
+            ORDER BY event_date ASC, id ASC
+        """, cve_ids).fetchall()
+        grouped: Dict[str, List[Dict]] = {}
+        for row in rows:
+            grouped.setdefault(row['cve_id'], []).append({
+                'event_type': row['event_type'],
+                'event_date': row['event_date'],
+                'detail': json.loads(row['detail']) if row['detail'] else {},
+            })
+        return grouped
+
     def get_cve_by_id(self, cve_id: str):
         """Return the single cves row for cve_id, or None if not found."""
         cursor = self.conn.cursor()
@@ -509,15 +630,52 @@ class CVEReporter:
         return cursor.fetchone()
 
     def mark_as_processed(self, cve_ids: List[str]):
-        """Mark CVEs as processed"""
+        """Mark CVEs as processed.
+
+        Writes a `processed` cve_events row only for CVEs that weren't
+        already processed — re-running --mark-processed on a CVE that's
+        already marked is a no-op timeline-wise, matching the
+        transition-only pattern the collector's own events follow (no
+        duplicate kev_added/poc_added on repeat runs either).
+
+        The SELECT (which CVEs are newly transitioning) and the UPDATE are
+        wrapped in one BEGIN IMMEDIATE transaction rather than run as two
+        separate statements. A plain SELECT-then-UPDATE takes SQLite's
+        write lock only at the UPDATE, so two concurrent reporter
+        invocations marking overlapping CVE sets could otherwise both read
+        processed=0 for the same CVE before either writes, and both log a
+        `processed` event for what's really one transition. BEGIN
+        IMMEDIATE takes the write lock up front instead, so a second
+        concurrent call blocks (via the busy_timeout set in __enter__)
+        until this one commits and sees the now-updated row.
+        """
+        if not cve_ids:
+            return
         cursor = self.conn.cursor()
         placeholders = ','.join('?' * len(cve_ids))
-        cursor.execute(f"""
-            UPDATE cves
-            SET processed = 1
-            WHERE id IN ({placeholders})
-        """, cve_ids)
-        self.conn.commit()
+
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            newly_processed = [
+                row['id'] for row in cursor.execute(
+                    f"SELECT id FROM cves WHERE id IN ({placeholders}) AND processed = 0",
+                    cve_ids,
+                ).fetchall()
+            ]
+
+            cursor.execute(f"""
+                UPDATE cves
+                SET processed = 1
+                WHERE id IN ({placeholders})
+            """, cve_ids)
+
+            for cve_id in newly_processed:
+                record_event(self.conn, cve_id, 'processed')
+
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
     
     def get_dashboard_stats(self) -> Dict:
         """Get comprehensive statistics for dashboard"""
@@ -601,7 +759,8 @@ class CVEReporter:
         return row
 
     def format_list_text(self, cves: List[sqlite3.Row], title: str,
-                          collection_info: Optional[Dict] = None) -> str:
+                          collection_info: Optional[Dict] = None,
+                          velocity_map: Optional[Dict[str, timedelta]] = None) -> str:
         """Render a list of CVEs as a banner + per-CVE text report.
 
         When collection_info is given ({name, description, member_count,
@@ -614,6 +773,12 @@ class CVEReporter:
         collection name in the Filters line). When collection_info is None
         (the default), behavior is unchanged from before that feature
         existed.
+
+        velocity_map (cve_id -> timedelta) is None on an ordinary run;
+        format_cve_text() then renders exactly as before this feature
+        existed. When set (--velocity/--max-days-to-exploit), each CVE's
+        entry gets an "Exploited: N days after disclosure" line for the
+        rows present in the map.
         """
         if not cves and collection_info is None:
             return "No CVEs found matching the specified filters."
@@ -638,7 +803,8 @@ class CVEReporter:
         if not cves:
             output.append("No CVEs found matching the specified filters.")
         for cve in cves:
-            output.append(self.format_cve_text(cve))
+            time_to_exploit = velocity_map.get(cve['id']) if velocity_map else None
+            output.append(self.format_cve_text(cve, time_to_exploit=time_to_exploit))
             output.append("-" * 70)
 
         return "\n".join(output)
@@ -913,24 +1079,34 @@ applyFilterAndSort();
         replacements = {'___DATA_JSON___': data_json, '___HEADER___': header}
         return _HTML_TOKEN_RE.sub(lambda m: replacements[m.group(0)], self._HTML_TEMPLATE)
 
-    def format_cve_text(self, cve: sqlite3.Row) -> str:
-        """Format a single CVE as text"""
+    def format_cve_text(self, cve: sqlite3.Row, time_to_exploit: Optional[timedelta] = None) -> str:
+        """Format a single CVE as text.
+
+        time_to_exploit is None on an ordinary run (default) and this
+        renders exactly as it did before the timeline feature existed.
+        Passed in (from --velocity/--max-days-to-exploit's velocity_map)
+        it adds one extra line. Named to avoid shadowing the module-level
+        days_to_exploit() function that computes it.
+        """
         exploit_flag = "🚨 EXPLOIT AVAILABLE" if cve['has_known_exploit'] else ""
-        
+
         output = []
         output.append(f"CVE: {cve['id']} {exploit_flag}")
         output.append(f"Severity: {cve['base_severity']} (Score: {cve['base_score']})")
         output.append(f"Published: {cve['published_date']}")
-        
+
         if cve['affects_infrastructure']:
             assets = json.loads(cve['affected_assets']) if cve['affected_assets'] else []
             categories = json.loads(cve['affected_categories']) if cve['affected_categories'] else []
             output.append(f"Affects Assets: {', '.join(assets)}")
             output.append(f"Categories: {', '.join(categories)}")
             output.append(f"Relevance Score: {cve['relevance_score']:.1f}")
-        
+
         if cve['has_known_exploit']:
             output.append("⚠️  KNOWN EXPLOIT - IMMEDIATE PATCHING REQUIRED")
+
+        if time_to_exploit is not None:
+            output.append(f"Exploited: {_format_duration(time_to_exploit)} after disclosure")
 
         if cve['has_poc']:
             poc_urls = json.loads(cve['poc_urls']) if cve['poc_urls'] else []
@@ -968,11 +1144,20 @@ applyFilterAndSort();
             'last_updated_date': cve['last_updated_date']
         }
     
-    def format_cve_detail(self, cve: sqlite3.Row, collections: Optional[List[str]] = None) -> str:
-        """Format a single CVE as a full seven-section detail view for terminal output.
+    def format_cve_detail(self, cve: sqlite3.Row, collections: Optional[List[str]] = None,
+                           lifecycle_events: Optional[List[Dict]] = None) -> str:
+        """Format a single CVE as a full detail view for terminal output: seven
+        sections, plus an eighth LIFECYCLE TIMELINE section when --timeline
+        was requested.
 
         collections is the list of collection names this CVE belongs to
         (from get_collections_for_cve()); shown in the IDENTITY section.
+
+        lifecycle_events controls the optional TIMELINE section: None (the
+        default) omits it entirely for the plain --cve view; a list (from
+        get_events_for_cve() — empty or not) renders it, including the
+        "no event history" case for CVEs ingested before this feature or
+        with no events at all.
         """
         SEP  = "=" * 70
         DASH = "-" * 70
@@ -1074,7 +1259,58 @@ applyFilterAndSort();
             out.append("  [unreviewed]         Not yet marked as processed")
         out.append("")
 
-        # ── 7. ALL ENRICHMENT DATA ─────────────────────────────────────────────
+        # ── 7. LIFECYCLE TIMELINE (only when --timeline was requested) ─────────
+        if lifecycle_events is not None:
+            out.append("LIFECYCLE TIMELINE")
+            out.append(DASH)
+            if not lifecycle_events:
+                out.append("  No event history available "
+                            "(this CVE predates the timeline feature, or has had "
+                            "no lifecycle transitions recorded since).")
+            else:
+                event_labels = {
+                    'ingested':     'First seen',
+                    'cvss_changed': 'CVSS updated',
+                    'kev_added':    'Added to CISA KEV list',
+                    'poc_added':    'POC published',
+                    'poc_updated':  'New POC URL added',
+                    'processed':    'Marked as processed',
+                }
+                for ev in lifecycle_events:
+                    detail = ev['detail'] or {}
+                    etype = ev['event_type']
+                    label = event_labels.get(etype, etype)
+                    if etype == 'ingested':
+                        extra = f" — CVSS {detail.get('cvss', 'N/A')} {detail.get('severity', '')}".rstrip()
+                    elif etype == 'cvss_changed':
+                        extra = f": {detail.get('from', '?')} → {detail.get('to', '?')}"
+                    elif etype == 'kev_added':
+                        extra = f" ({detail.get('source', 'cisa_kev')})"
+                    elif etype == 'poc_added':
+                        sources = detail.get('source') or []
+                        extra = f" ({', '.join(sources)})" if sources else ""
+                    elif etype == 'poc_updated':
+                        extra = f": {detail.get('new_url', '')}"
+                    else:
+                        extra = ""
+                    out.append(f"  {ev['event_date']}  [{etype:<13}] {label}{extra}")
+
+                out.append("")
+                kev_event = next((e for e in lifecycle_events if e['event_type'] == 'kev_added'), None)
+                poc_event = next((e for e in lifecycle_events if e['event_type'] == 'poc_added'), None)
+                if kev_event is not None:
+                    d = days_to_exploit(cve['published_date'], [kev_event])
+                    out.append(f"Time to KEV:        {_format_duration(d)} after disclosure"
+                               if d is not None else "Time to KEV:        (could not compute)")
+                if poc_event is not None:
+                    d = days_to_exploit(cve['published_date'], [poc_event])
+                    out.append(f"Time to POC:        {_format_duration(d)} after disclosure"
+                               if d is not None else "Time to POC:        (could not compute)")
+                if kev_event is None and poc_event is None:
+                    out.append("Time to exploit:    not yet exploited")
+            out.append("")
+
+        # ── 8. ALL ENRICHMENT DATA ─────────────────────────────────────────────
         out.append("ALL ENRICHMENT DATA")
         out.append(DASH)
 
@@ -1117,13 +1353,19 @@ applyFilterAndSort();
 
     def generate_report(self, cves: List[sqlite3.Row], title: str, filter_meta: Dict,
                        output_format: str = 'text', filename: Optional[str] = None,
-                       collection_info: Optional[Dict] = None):
+                       collection_info: Optional[Dict] = None,
+                       velocity_map: Optional[Dict[str, timedelta]] = None):
         """Dispatch to the appropriate format_list_* method and write the result.
 
         filter_meta is only consumed by the json format (it becomes the
         "filter" key); text/csv/html use the human-readable `title` string.
         collection_info is only consumed by the text format (see
         format_list_text) and is None outside the --collection + text case.
+        velocity_map (cve_id -> timedelta, from --velocity/--max-days-to-exploit)
+        is likewise text-only for v1 — json/csv/html output stay exactly as
+        they were; --velocity/--max-days-to-exploit still correctly filter
+        and sort `cves` for every format, just without a field explaining
+        why for non-text output. See docs/features/TIMELINE_VIEW_FEATURE.md.
         """
         if output_format == 'json':
             output = self.format_list_json(cves, filter_meta)
@@ -1132,7 +1374,8 @@ applyFilterAndSort();
         elif output_format == 'html':
             output = self.format_list_html(cves, title)
         else:  # text
-            output = self.format_list_text(cves, title, collection_info=collection_info)
+            output = self.format_list_text(cves, title, collection_info=collection_info,
+                                            velocity_map=velocity_map)
 
         write_output(output, filename)
 
@@ -1341,6 +1584,15 @@ Cron usage:
     parser.add_argument('--rename-collection', nargs=2, metavar=('OLD', 'NEW'),
                        help='Rename a collection')
 
+    # Timeline / velocity (see docs/features/TIMELINE_VIEW_FEATURE.md)
+    parser.add_argument('--timeline', action='store_true',
+                       help='Show the lifecycle event log for a specific CVE (requires --cve; --format text only)')
+    parser.add_argument('--velocity', action='store_true',
+                       help='Sort results by time from disclosure to first exploit event (fastest first)')
+    parser.add_argument('--max-days-to-exploit', type=int, metavar='N',
+                       help='Show only CVEs exploited within N days of NVD publication '
+                            '(composable with any base mode; independent of --velocity)')
+
     # Options
     parser.add_argument('--hours', type=int, default=24,
                        help='Hours to look back (default: 24)')
@@ -1353,6 +1605,14 @@ Cron usage:
                        help='Mark displayed CVEs as processed')
     
     args = parser.parse_args()
+
+    # --timeline only means anything alongside --cve (it extends the single-CVE
+    # detail view); without --cve it would otherwise be silently ignored by
+    # falling through to the filtered-list path below, which is worse than
+    # failing loudly here.
+    if args.timeline and not args.cve:
+        print("Error: --timeline requires --cve <CVE-ID>.", file=sys.stderr)
+        sys.exit(1)
 
     # The collection-management mutation actions never consume --output (per
     # the doc's CLI design, they print a plain confirmation/warning); route
@@ -1466,6 +1726,14 @@ Cron usage:
                 print(f"No data found for {cve_id}.")
                 print("Run the collector to ingest new CVEs: python cve_collector.py")
                 sys.exit(1)
+            if args.timeline and args.format != 'text':
+                print(
+                    "Error: --timeline currently only supports --format text "
+                    "(json/csv/html are not yet implemented for --timeline).",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
             if args.format == 'json':
                 output = reporter.format_cve_detail_json(cve)
             elif args.format == 'csv':
@@ -1474,7 +1742,9 @@ Cron usage:
                 output = reporter.format_list_html([cve], f"CVE Detail: {cve_id}")
             else:
                 collections = reporter.get_collections_for_cve(cve_id)
-                output = reporter.format_cve_detail(cve, collections=collections)
+                lifecycle_events = reporter.get_events_for_cve(cve_id) if args.timeline else None
+                output = reporter.format_cve_detail(cve, collections=collections,
+                                                      lifecycle_events=lifecycle_events)
             write_output(output, args.output)
             if args.mark_processed:
                 reporter.mark_as_processed([cve_id])
@@ -1546,6 +1816,38 @@ Cron usage:
         # non-crashing output for cves=[] per the output-formats spec's
         # edge-case table, and that has to hold for --output too.
 
+        # --velocity / --max-days-to-exploit: compute time-to-exploit per row
+        # (one batched events query for the whole candidate set, not one per
+        # row) and use it to filter and/or sort `cves` before any format_*
+        # method sees it. velocity_map stays None when neither flag is set,
+        # so an ordinary run pays no extra query and format_cve_text()
+        # renders exactly as it did before this feature existed.
+        velocity_map: Optional[Dict[str, timedelta]] = None
+        if args.velocity or args.max_days_to_exploit is not None:
+            events_by_cve = reporter.get_events_for_cves([cve['id'] for cve in cves])
+            velocity_map = {}
+            for cve in cves:
+                d = days_to_exploit(cve['published_date'], events_by_cve.get(cve['id'], []))
+                if d is not None:
+                    velocity_map[cve['id']] = d
+
+            if args.max_days_to_exploit is not None:
+                # Compare full elapsed time, not timedelta.days (which
+                # floors) -- a CVE exploited in 7 days 23 hours must fail
+                # --max-days-to-exploit 7, not slip through because .days
+                # truncated it down to 7. _format_duration() still *shows*
+                # that same CVE as "7 days" elsewhere (rounded for
+                # readability); the filter itself has to be exact.
+                max_seconds = args.max_days_to_exploit * 86400
+                cves = [cve for cve in cves
+                        if cve['id'] in velocity_map
+                        and velocity_map[cve['id']].total_seconds() <= max_seconds]
+
+            if args.velocity:
+                # CVEs with no computable time-to-exploit sort last, per the
+                # design doc's edge-case table.
+                cves = sorted(cves, key=lambda cve: velocity_map.get(cve['id'], timedelta.max))
+
         # Dynamic title reflecting all active flags
         title_parts = []
         if args.new:
@@ -1572,6 +1874,10 @@ Cron usage:
             title_parts.append("Exploits Only")
         if pocs_only_flag:
             title_parts.append("POCs Only")
+        if args.velocity:
+            title_parts.append("Velocity Sorted")
+        if args.max_days_to_exploit is not None:
+            title_parts.append(f"Exploited Within {args.max_days_to_exploit}d")
 
         # Deliberately never append a "Collection: X" entry to title_parts —
         # title_parts is reused verbatim (unmodified) as the "Filters: ..."
@@ -1629,7 +1935,7 @@ Cron usage:
             }
 
         reporter.generate_report(cves, title, filter_meta, args.format, args.output,
-                                  collection_info=collection_info)
+                                  collection_info=collection_info, velocity_map=velocity_map)
 
         # Mark as processed if requested
         if args.mark_processed and cves:
