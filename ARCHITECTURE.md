@@ -164,6 +164,17 @@ CVE Data Incoming
     └────────────────────────┘
 ```
 
+**Note (see docs/features/TIMELINE_VIEW_FEATURE.md):** the transitions in this
+diagram (score change, exploit added, POC added) are now also durably logged
+as rows in a `cve_events` table, not just reflected in `cves`' current-state
+columns as drawn above. `--cve ID --timeline` replays that log for one CVE;
+`--velocity`/`--max-days-to-exploit` use it to sort/filter reports by how
+fast a CVE went from disclosure (`published_date`) to its first
+`kev_added`/`poc_added` event. Rows ingested before this feature shipped
+have no event history — only new transitions are logged, retroactively
+reconstructing history for older rows is out of scope (see the feature doc's
+Future Considerations).
+
 ## Reporter Query Paths
 
 ```

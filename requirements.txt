@@ -1,1 +1,4 @@
 requests>=2.31.0
+
+# Dev/test only (see tests/) -- not required to run cve_collector.py/cve_reporter.py.
+pytest>=7.4.0

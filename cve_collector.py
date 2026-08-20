@@ -35,6 +35,7 @@ import logging
 from datetime import datetime
 from typing import Dict, Set, Tuple, Optional, List
 import config
+from events import record_event
 
 # Setup logging
 logging.basicConfig(
@@ -67,7 +68,22 @@ class CVECollector:
         logger.info("Database initialized successfully")
 
     def migrate_database(self):
-        """Add POC columns to existing database if missing"""
+        """Bring an existing database up to date with schema.sql.
+
+        Column additions to `cves` need an explicit ALTER — SQLite has no
+        "ADD COLUMN IF NOT EXISTS" — so those stay hand-listed below.
+        Everything else in schema.sql (new tables, indexes, the cve_stats
+        view) is applied by re-running the whole file: every CREATE TABLE/
+        INDEX statement is already IF NOT EXISTS, so that's safe to redo
+        unconditionally. This used to cherry-pick just the view and idx_poc
+        out of schema.sql by string-matching, which silently skipped whole
+        new tables added later (collections/collection_members, then
+        cve_events) on any database that predated them — re-running the
+        full file closes that gap generally instead of one table at a time.
+        The view is dropped first so its definition actually refreshes if
+        it changes in schema.sql, rather than staying stale under IF NOT
+        EXISTS.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(cves)")
@@ -83,15 +99,10 @@ class CVECollector:
                 logger.info(f"Adding column {col_name} to cves table")
                 cursor.execute(f"ALTER TABLE cves ADD COLUMN {col_name} {col_type}")
 
-        # Recreate view and index from schema
         cursor.execute("DROP VIEW IF EXISTS cve_stats")
-        cursor.execute("DROP INDEX IF EXISTS idx_poc")
         with open('schema.sql', 'r') as f:
             schema = f.read()
-        for statement in schema.split(';'):
-            stmt = statement.strip()
-            if 'CREATE VIEW' in stmt or 'CREATE INDEX IF NOT EXISTS idx_poc' in stmt:
-                cursor.execute(stmt)
+        conn.executescript(schema)
 
         conn.commit()
         conn.close()
@@ -407,7 +418,93 @@ class CVECollector:
             now,  # first_seen
             now   # last_checked
         ))
-    
+
+    @staticmethod
+    def _cve_row_changed(old: sqlite3.Row, cve_data: dict) -> bool:
+        """True if any tracked field differs between the pre-update `old` row
+        (base_score, base_severity, has_known_exploit, has_poc, poc_urls —
+        same shape as the pre-upsert SELECT in collect()) and the freshly
+        parsed cve_data. Drives collect()'s stats['updated'] counter and log
+        line. Deliberately does not compare poc_urls itself (a URL added to
+        an already-true has_poc doesn't flip this to "updated" for stats
+        purposes, matching how it only fires a poc_updated lifecycle event
+        rather than being folded into "updated" there either).
+        """
+        old_score, old_severity, old_exploit, old_poc, old_poc_urls = old
+        return (old_score != cve_data['base_score'] or
+                old_severity != cve_data['base_severity'] or
+                old_exploit != cve_data['has_known_exploit'] or
+                old_poc != cve_data['has_poc'])
+
+    def _record_lifecycle_events(self, conn: sqlite3.Connection, cve_id: str,
+                                  old: Optional[sqlite3.Row], cve_data: dict):
+        """Write cve_events rows for whatever changed between `old` (the prior
+        row's base_score/base_severity/has_known_exploit/has_poc/poc_urls, or
+        None if this CVE has never been seen before) and cve_data (the
+        freshly parsed values about to be upserted). Must be called with the
+        `old` row fetched *before* upsert_cve() runs, since that's the only
+        place the pre-update values are still available.
+
+        Per docs/features/TIMELINE_VIEW_FEATURE.md, collapsed to a single
+        kev_added event rather than the doc's separate kev_added +
+        exploit_confirmed: has_known_exploit is set exclusively from CISA
+        KEV in this collector (see download_cisa_kev()/parse_cve_data()),
+        so the two would always fire together — no second exploit source
+        exists yet to make them meaningfully different.
+
+        kev_added's detail omits a kev_date: the CISA KEV feed's per-entry
+        dateAdded date isn't threaded through anywhere in this collector
+        today (download_cisa_kev() returns a bare set of CVE IDs, not a
+        dict with dates), and cves.exploit_added_date itself is never
+        populated either — that's a pre-existing gap in the collector, not
+        something to paper over with a fabricated date here. The event's
+        own event_date already records when *we* detected the addition,
+        which is the best available signal.
+
+        A brand-new CVE (old is None) still falls through to the
+        exploit/POC checks below (treated as a 0/false->new-value
+        transition) rather than returning right after `ingested` — a CVE
+        can enter this collector's view already KEV-listed or already
+        carrying a POC (e.g. this collector's first run, or a CVE that
+        only now started matching the asset inventory), and skipping
+        kev_added/poc_added for that case would leave --timeline silently
+        blank and --velocity/--max-days-to-exploit blind to exactly the
+        already-fast-exploited CVEs this feature exists to surface.
+        cvss_changed is the only event type that stays new-CVE-exempt,
+        since "changed" isn't meaningful without a prior score to compare.
+        """
+        if old is None:
+            record_event(conn, cve_id, 'ingested', {
+                'cvss': cve_data['base_score'],
+                'severity': cve_data['base_severity'],
+            })
+            old_exploit, old_poc, old_poc_urls = False, False, None
+        else:
+            old_score, old_severity, old_exploit, old_poc, old_poc_urls = old
+
+            if old_score != cve_data['base_score']:
+                record_event(conn, cve_id, 'cvss_changed', {
+                    'from': old_score,
+                    'to': cve_data['base_score'],
+                })
+
+        if not old_exploit and cve_data['has_known_exploit']:
+            record_event(conn, cve_id, 'kev_added', {'source': 'cisa_kev'})
+
+        new_poc = bool(cve_data['has_poc'])
+        if not old_poc and new_poc:
+            record_event(conn, cve_id, 'poc_added', {
+                'source': json.loads(cve_data['poc_source']) if cve_data['poc_source'] else [],
+                'urls': json.loads(cve_data['poc_urls']) if cve_data['poc_urls'] else [],
+            })
+        elif old_poc and new_poc:
+            # POC status was already true; only report URLs that are new
+            # since last run, not the whole set again.
+            old_urls = set(json.loads(old_poc_urls)) if old_poc_urls else set()
+            new_urls = set(json.loads(cve_data['poc_urls'])) if cve_data['poc_urls'] else set()
+            for url in sorted(new_urls - old_urls):
+                record_event(conn, cve_id, 'poc_updated', {'new_url': url})
+
     def collect(self):
         """Main collection process"""
         logger.info("=" * 60)
@@ -460,25 +557,34 @@ class CVECollector:
 
             # Check if this is a new or updated CVE
             cursor = conn.cursor()
-            cursor.execute("SELECT base_score, base_severity, has_known_exploit FROM cves WHERE id = ?",
-                          (cve_data['id'],))
+            cursor.execute(
+                "SELECT base_score, base_severity, has_known_exploit, has_poc, poc_urls "
+                "FROM cves WHERE id = ?",
+                (cve_data['id'],))
             existing = cursor.fetchone()
 
             if existing:
-                # Check if anything changed
-                old_score, old_severity, old_exploit = existing
-                if (old_score != cve_data['base_score'] or
-                    old_severity != cve_data['base_severity'] or
-                    old_exploit != cve_data['has_known_exploit']):
+                # Check if anything changed. Extracted to a static method
+                # (below) so it's directly unit-testable without going
+                # through collect()'s network I/O -- this is exactly the
+                # check that had a POC-tracking gap (has_poc wasn't
+                # compared, so a POC-only change fell through uncounted
+                # here even though _record_lifecycle_events() correctly
+                # wrote a poc_added event for it).
+                old_score, old_severity, old_exploit, old_poc, old_poc_urls = existing
+                if self._cve_row_changed(existing, cve_data):
                     stats['updated'] += 1
                     logger.info(f"Updated: {cve_data['id']} - Score: {old_score}->{cve_data['base_score']}, "
                                f"Severity: {old_severity}->{cve_data['base_severity']}, "
-                               f"Exploit: {old_exploit}->{cve_data['has_known_exploit']}")
+                               f"Exploit: {old_exploit}->{cve_data['has_known_exploit']}, "
+                               f"POC: {old_poc}->{cve_data['has_poc']}")
             else:
                 stats['new'] += 1
                 logger.debug(f"New: {cve_data['id']} - {cve_data['base_severity']} ({cve_data['base_score']})")
 
-            # UPSERT the CVE
+            # Record lifecycle events for whatever changed, using the
+            # pre-update `existing` row fetched above, then UPSERT the CVE.
+            self._record_lifecycle_events(conn, cve_data['id'], existing, cve_data)
             self.upsert_cve(conn, cve_data)
 
             # Update statistics

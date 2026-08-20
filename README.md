@@ -63,6 +63,7 @@ A modular threat monitoring tool that separates data collection from reporting, 
 - Asset-specific reports
 - Single CVE deep-dive lookup (`--cve`)
 - Named collections/watchlists (`--collection`) to group CVEs for a project, independent of any other filter
+- Per-CVE lifecycle timeline (`--timeline`) and exploitation-velocity sorting/filtering (`--velocity`, `--max-days-to-exploit`)
 
 ### ✅ External Asset Configuration
 - Asset inventory and weights stored in `assets.json` (separate from code)
@@ -220,6 +221,9 @@ Jump directly to any CVE in the database for a full-record view — CVSS score, 
 
 # Mark as processed after viewing
 ./cve_reporter.py --cve CVE-2026-12345 --mark-processed
+
+# Full event-log timeline (see Lifecycle Timeline & Velocity below)
+./cve_reporter.py --cve CVE-2026-12345 --timeline
 ```
 
 If the CVE is not in the database, a not-found message is printed and the command exits with code `1`.
@@ -282,6 +286,24 @@ Named, ad-hoc sets of CVEs for a project or report — independent of severity/a
 ./cve_reporter.py --collection "Q3 Red Team" --exploits-only
 ./cve_reporter.py --collection "Customer XYZ" --format json --output customer_xyz.json
 ```
+
+#### Lifecycle Timeline & Exploitation Velocity
+
+The collector writes an append-only event log (`cve_events`) whenever a CVE is first ingested, its CVSS score changes, it's added to CISA KEV, or a POC appears. `--timeline` shows that log for one CVE (requires `--cve`; `--format text` only, for now). `--velocity`/`--max-days-to-exploit` sort or filter a report by how fast each CVE went from disclosure to first exploit — these compose with any `--format`, but the "Exploited: N days after disclosure" line itself only renders in text output for now; json/csv/html still come back correctly sorted/filtered. See `docs/features/TIMELINE_VIEW_FEATURE.md` for the event types and design rationale.
+
+```bash
+# Full lifecycle event log for one CVE (requires --cve; text output only)
+./cve_reporter.py --cve CVE-2026-12345 --timeline
+
+# Sort exploited CVEs by how fast they were weaponized (fastest first)
+./cve_reporter.py --exploits-only --velocity
+
+# Only CVEs weaponized within a week of disclosure — composes with any other filter
+./cve_reporter.py --exploits-only --max-days-to-exploit 7
+./cve_reporter.py --critical --max-days-to-exploit 3 --velocity
+```
+
+CVEs ingested before this feature shipped have no event history — `--timeline` shows "No event history available" for those, and they sort last under `--velocity` (or are excluded by `--max-days-to-exploit`) until they earn a new event.
 
 ## Database Schema
 
